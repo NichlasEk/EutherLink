@@ -14,7 +14,7 @@ import threading
 import time
 import uuid
 from pathlib import Path
-from typing import Literal
+from typing import Any, Literal
 
 import numpy as np
 import soundfile as sf
@@ -185,6 +185,17 @@ class EutherLinkTts:
             sample_rate = int(model.tts_model.sample_rate)
             silence = np.zeros(int(sample_rate * 0.35), dtype=np.float32)
             voice_sample_path = write_voice_sample(job_id, self.jobs_dir, req)
+            cloned_cfg_value = min(req.cfg_value, float(os.environ.get("EUTHERLINK_CLONED_VOICE_MAX_CFG", "2.0")))
+            prompt_cache: dict[str, Any] | None = None
+            initial_prompt_cache: dict[str, Any] | None = None
+            if voice_sample_path is not None:
+                with self.model_lock:
+                    prompt_cache = model.tts_model.build_prompt_cache(
+                        prompt_text=req.prompt_text if req.prompt_text else None,
+                        prompt_wav_path=str(voice_sample_path) if req.prompt_text else None,
+                        reference_wav_path=str(voice_sample_path),
+                    )
+                initial_prompt_cache = prompt_cache
 
             for index, chunk in enumerate(chunks, start=1):
                 progress = 0.05 + 0.85 * ((index - 1) / max(1, len(chunks)))
@@ -194,25 +205,34 @@ class EutherLinkTts:
                     progress=progress,
                     message=f"Synthesizing chunk {index}/{len(chunks)}",
                 )
-                final_text = (
-                    chunk
-                    if voice_sample_path is not None
-                    else f"({req.voice_instruction}){chunk}" if req.voice_instruction.strip() else chunk
-                )
-                generate_kwargs: dict[str, object] = {
-                    "text": final_text,
-                    "cfg_value": req.cfg_value,
-                    "inference_timesteps": req.inference_timesteps,
-                    "normalize": req.normalize,
-                    "denoise": False,
-                }
                 if voice_sample_path is not None:
-                    generate_kwargs["prompt_wav_path"] = str(voice_sample_path)
-                    generate_kwargs["reference_wav_path"] = str(voice_sample_path)
-                    if req.prompt_text:
-                        generate_kwargs["prompt_text"] = req.prompt_text
-                with self.model_lock:
-                    wav = model.generate(**generate_kwargs)
+                    with self.model_lock:
+                        wav_tensor, _text_tokens, new_audio_feat = model.tts_model.generate_with_prompt_cache(
+                            target_text=chunk,
+                            prompt_cache=prompt_cache,
+                            max_len=4096,
+                            cfg_value=cloned_cfg_value,
+                            inference_timesteps=req.inference_timesteps,
+                            retry_badcase=True,
+                        )
+                        if initial_prompt_cache is not None:
+                            prompt_cache = model.tts_model.merge_prompt_cache(
+                                initial_prompt_cache,
+                                f" {chunk}",
+                                new_audio_feat,
+                            )
+                    wav = wav_tensor.squeeze(0).cpu().numpy()
+                else:
+                    final_text = f"({req.voice_instruction}){chunk}" if req.voice_instruction.strip() else chunk
+                    generate_kwargs: dict[str, object] = {
+                        "text": final_text,
+                        "cfg_value": req.cfg_value,
+                        "inference_timesteps": req.inference_timesteps,
+                        "normalize": req.normalize,
+                        "denoise": False,
+                    }
+                    with self.model_lock:
+                        wav = model.generate(**generate_kwargs)
                 wav_parts.append(np.asarray(wav, dtype=np.float32))
                 if index != len(chunks):
                     wav_parts.append(silence)
