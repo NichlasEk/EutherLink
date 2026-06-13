@@ -194,7 +194,11 @@ class EutherLinkTts:
                     progress=progress,
                     message=f"Synthesizing chunk {index}/{len(chunks)}",
                 )
-                final_text = f"({req.voice_instruction}){chunk}" if req.voice_instruction.strip() else chunk
+                final_text = (
+                    chunk
+                    if voice_sample_path is not None
+                    else f"({req.voice_instruction}){chunk}" if req.voice_instruction.strip() else chunk
+                )
                 generate_kwargs: dict[str, object] = {
                     "text": final_text,
                     "cfg_value": req.cfg_value,
