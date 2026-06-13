@@ -1,4 +1,4 @@
-# Runtime data
+# EutherLink runtime state
 /data/
 /jobs/
 /outputs/
@@ -6,11 +6,14 @@
 /incoming/
 /processed/
 /tmp/
+/temp/
 /cache/
 /logs/
 *.log
+*.pid
+*.sock
 
-# Private audiobook/source material
+# Private source material and generated media
 /books/
 /ebooks/
 /audiobooks/
@@ -27,8 +30,6 @@
 *.pdf
 *.txt
 *.md.private
-
-# Generated audio
 *.wav
 *.mp3
 *.m4a
@@ -37,10 +38,15 @@
 *.ogg
 *.opus
 
-# Model artifacts and AI caches
+# Model artifacts, AI caches, and checkpoints
 /models/
 /checkpoints/
 /lora/
+/.cache/
+/hf_cache/
+/huggingface/
+/torch_cache/
+/triton/
 *.safetensors
 *.ckpt
 *.pth
@@ -51,7 +57,7 @@
 *.npz
 *.npy
 
-# Local config and secrets
+# Local config, credentials, and machine-specific overrides
 .env
 .env.*
 !.env.example
@@ -60,9 +66,12 @@
 *.key
 *.pem
 *.crt
+*.p12
 config.local.*
 settings.local.*
 secrets.*
+*.service.local
+*.timer.local
 
 # Python
 __pycache__/
@@ -72,30 +81,36 @@ __pycache__/
 .venv/
 venv/
 env/
+.venv*/
 .mypy_cache/
 .pytest_cache/
 .ruff_cache/
+.pyre/
+.tox/
+.nox/
 .coverage
+coverage.xml
 htmlcov/
 dist/
 build/
 *.egg-info/
+pip-wheel-metadata/
 
-# Node/tooling, in case a UI is added later
+# Node/tooling, if a UI is added later
 node_modules/
 .npm/
 .pnpm-store/
 .yarn/
 .vite/
+.parcel-cache/
+coverage/
 
-# OS/editor
+# Editors and OS files
 .DS_Store
 Thumbs.db
 *.swp
 *.swo
+*.tmp
+*~
 .idea/
 .vscode/
-
-# Systemd/user local overrides
-*.service.local
-*.timer.local

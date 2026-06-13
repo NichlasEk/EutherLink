@@ -1,0 +1,173 @@
+# EutherLink cautious retry plan
+
+target_server = "192.168.32.186"
+target_services = ["EutherBooks", "EutherOxide", "apothictec.se frontend"]
+local_worker = "/home/nichlas/EutherLink/start.sh"
+
+# Do not store server passphrases or private credentials in this file.
+
+[goal]
+summary = "Use this RTX 4090 machine as a LAN worker for heavy AI jobs while the server keeps hosting the public/user-facing services."
+first_worker = "VoxCPM2 audiobook-style TTS"
+main_risk = "Previous model test froze the whole local machine."
+
+[principles]
+step_1 = "Do not contact the production server until the local worker survives a small local test."
+step_2 = "Separate server startup, model import, model load, and inference into separate observations."
+step_3 = "Capture logs and GPU state around every heavy step."
+step_4 = "Use tiny text first, then increase input size only after a clean run."
+step_5 = "Stop immediately on GPU memory exhaustion, kernel errors, thermal/power warnings, or system responsiveness problems."
+
+[preflight]
+commands = [
+  "git status --short",
+  "python --version",
+  "nvidia-smi",
+  "df -h /home/nichlas/EutherLink /tmp",
+  "curl -s http://127.0.0.1:8765/health || true"
+]
+notes = [
+  "Confirm no old EutherLink process is already running on port 8765.",
+  "Confirm the VoxCPM2 virtualenv and model snapshot paths still exist.",
+  "Keep a separate terminal open with nvidia-smi or similar GPU monitoring."
+]
+
+[phase_1_local_server_only]
+purpose = "Verify FastAPI starts without doing model inference."
+actions = [
+  "Start /home/nichlas/EutherLink/start.sh with logs captured to /tmp/eutherlink-retry.log.",
+  "Call GET /health.",
+  "Do not submit a TTS job in this phase."
+]
+success = [
+  "Server answers /health.",
+  "No unexpected CPU/GPU spike.",
+  "No crash or freeze after 60 seconds idle."
+]
+
+[phase_2_model_load_only]
+purpose = "Determine whether freeze happens during VoxCPM2 import/load rather than synthesis."
+actions = [
+  "Trigger a path that loads the model once, preferably with a tiny request if no load-only endpoint exists.",
+  "Watch nvidia-smi memory allocation and process state.",
+  "Keep log output unbuffered."
+]
+success = [
+  "Model load completes.",
+  "GPU memory stabilizes.",
+  "System remains responsive for at least 120 seconds."
+]
+
+[phase_3_tiny_tts]
+purpose = "Run the smallest possible synthesis job."
+request = {
+  text = "Hej.",
+  voice_instruction = "A calm Swedish narrator.",
+  output_format = "wav",
+  inference_timesteps = 1,
+  cfg_value = 1.0,
+  max_chunk_chars = 120
+}
+success = [
+  "Job reaches done.",
+  "Audio file downloads and is non-empty.",
+  "No system freeze or GPU reset."
+]
+
+[phase_4_normal_small_tts]
+purpose = "Test practical audiobook settings after tiny inference succeeds."
+request = {
+  text = "Det har ar ett kort test av svensk ljudboksgenerering.",
+  voice_instruction = "A calm, warm Swedish audiobook narrator with clear pronunciation and natural pacing.",
+  output_format = "opus",
+  inference_timesteps = 10,
+  cfg_value = 2.0,
+  max_chunk_chars = 700
+}
+success = [
+  "Job reaches done.",
+  "Opus file downloads and plays.",
+  "Worker remains stable after completion."
+]
+
+[phase_5_server_integration]
+purpose = "Only after local stability: connect EutherBooks/EutherOxide-side workflow to this LAN worker."
+actions = [
+  "Verify network reachability between 192.168.32.186 and this machine.",
+  "Prefer a server-side config value for the worker URL instead of hardcoding.",
+  "Use an internal LAN URL for this worker, not a public endpoint.",
+  "Add a short timeout and retry policy on the server caller."
+]
+notes = [
+  "Authenticate to the server interactively or through an existing safe key setup.",
+  "Do not store the passphrase in repo files, logs, shell history snippets, or service configs."
+]
+
+[freeze_diagnostics_if_it_happens]
+collect_after_reboot = [
+  "journalctl -b -1 -k --no-pager | tail -200",
+  "journalctl -b -1 --no-pager | rg -i 'nvrm|xid|cuda|oom|hung|watchdog|thermal|power|panic|reset'",
+  "dmesg | rg -i 'nvrm|xid|cuda|oom|hung|watchdog|thermal|power|panic|reset'",
+  "cat /tmp/eutherlink-retry.log"
+]
+likely_causes_to_check = [
+  "CUDA/GPU driver Xid reset or hard hang.",
+  "Out-of-memory behavior during model optimize/load.",
+  "Thermal or power instability under sudden 4090 load.",
+  "Model optimization step using too much memory or compiling kernels.",
+  "CPU RAM exhaustion causing severe swap or lockup."
+]
+
+[next_changes_to_consider_before_retry]
+items = [
+  "Add a /v1/tts/model/load endpoint so model load can be tested without synthesis.",
+  "Add structured logging for job phase, chunk index, GPU memory snapshot, and elapsed time.",
+  "Add optional safer mode: optimize=false, lower defaults, and wav-only for first run.",
+  "Add a startup flag to bind only to 127.0.0.1 during local validation."
+]
+
+[run_2026_06_13_0951]
+local_worker_ip = "192.168.32.88"
+phase_1_local_server_only = "passed"
+phase_3_tiny_tts = "passed"
+phase_4_normal_small_tts = "passed"
+phase_5_lan_bind_health = "passed"
+observations = [
+  "Started first on 127.0.0.1:8765 and /health passed.",
+  "Tiny WAV job completed: /tmp/eutherlink-tiny.wav, 301 KiB, mono 48000 Hz PCM.",
+  "First VoxCPM2 warmup step took about 93 seconds, likely Torch/Inductor compile.",
+  "Model reported one Badcase detected retry on the tiny job, then completed.",
+  "After model load, VoxCPM Python process held about 6.8 GiB GPU memory.",
+  "Short normal Opus job completed: /tmp/eutherlink-small.opus, 29 KiB, mono 48000 Hz Opus.",
+  "Restarted worker on 0.0.0.0:8765 and health passed on http://192.168.32.88:8765/health.",
+  "The server at 192.168.32.186 answered HTTP with Caddy and redirected to https://apothictech.se/.",
+  "ping and ip addr were blocked by the sandbox, but curl and socket route worked."
+]
+current_state = [
+  "EutherLink is running bound to 0.0.0.0:8765 in the current shell session.",
+  "No freeze was observed during this cautious retry."
+]
+
+[server_integration_2026_06_13]
+server = "192.168.32.186"
+ssh_hardening = [
+  "Verified key login with /home/nichlas/.ssh/euther_server.",
+  "Added /etc/ssh/sshd_config.d/90-disable-password-auth.conf on the server.",
+  "Effective sshd config now has passwordauthentication no and kbdinteractiveauthentication no.",
+  "Reloaded ssh and verified password-only login is denied with Permission denied (publickey)."
+]
+eutherbooks = [
+  "Added an eutherlink TTS backend in /home/nichlas/EutherBooks/eutherbooks/tts.py on the server.",
+  "Backend posts jobs to EutherLink, polls status, downloads WAV audio, and writes it into the existing EutherBooks audio path.",
+  "Added systemd drop-in /etc/systemd/system/eutherbooks.service.d/20-eutherlink-worker.conf.",
+  "EutherBooks now runs with EUTHERBOOKS_TTS_BACKEND=eutherlink and EUTHERBOOKS_EUTHERLINK_URL=http://192.168.32.88:8765.",
+  "Restarted eutherbooks.service and /health reports tts_backend=eutherlink.",
+  "EutherOxide already proxies /eutherbooks to EutherBooks; no EutherOxide code change was needed."
+]
+verification = [
+  "Server curl to http://192.168.32.88:8765/health passed.",
+  "Direct EutherBooks backend test generated /tmp/eutherbooks-eutherlink-test.wav on the server, 138284 bytes.",
+  "Voice-id mapping test with voice='sv' generated /tmp/eutherbooks-eutherlink-sv-test.wav on the server, 61484 bytes.",
+  "Server .venv/bin/python -m pytest tests/test_tts.py passed: 4 tests.",
+  "Public /eutherbooks path is behind the existing EutherHost login gate."
+]
