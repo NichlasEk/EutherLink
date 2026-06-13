@@ -6,8 +6,10 @@ import base64
 import binascii
 import concurrent.futures
 import dataclasses
+import hashlib
 import json
 import os
+import random
 import re
 import subprocess
 import threading
@@ -18,6 +20,7 @@ from typing import Any, Literal
 
 import numpy as np
 import soundfile as sf
+import torch
 from fastapi import FastAPI, HTTPException
 from fastapi.responses import FileResponse
 from pydantic import BaseModel, Field
@@ -49,6 +52,7 @@ class TtsJobRequest(BaseModel):
     prompt_wav_base64: str | None = Field(default=None, max_length=32_000_000)
     reference_wav_base64: str | None = Field(default=None, max_length=32_000_000)
     prompt_text: str | None = Field(default=None, max_length=500)
+    seed: int | None = Field(default=None, ge=0, le=2_147_483_647)
 
 
 class TtsJobAccepted(BaseModel):
@@ -186,10 +190,13 @@ class EutherLinkTts:
             silence = np.zeros(int(sample_rate * 0.35), dtype=np.float32)
             voice_sample_path = write_voice_sample(job_id, self.jobs_dir, req)
             cloned_cfg_value = min(req.cfg_value, float(os.environ.get("EUTHERLINK_CLONED_VOICE_MAX_CFG", "2.0")))
+            cloned_seed = stable_voice_seed(voice_sample_path, req) if voice_sample_path is not None else None
             prompt_cache: dict[str, Any] | None = None
             initial_prompt_cache: dict[str, Any] | None = None
             if voice_sample_path is not None:
                 with self.model_lock:
+                    if cloned_seed is not None:
+                        set_generation_seed(cloned_seed)
                     prompt_cache = model.tts_model.build_prompt_cache(
                         prompt_text=req.prompt_text if req.prompt_text else None,
                         prompt_wav_path=str(voice_sample_path) if req.prompt_text else None,
@@ -207,6 +214,8 @@ class EutherLinkTts:
                 )
                 if voice_sample_path is not None:
                     with self.model_lock:
+                        if cloned_seed is not None:
+                            set_generation_seed(cloned_seed)
                         wav_tensor, _text_tokens, new_audio_feat = model.tts_model.generate_with_prompt_cache(
                             target_text=chunk,
                             prompt_cache=prompt_cache,
@@ -282,6 +291,30 @@ def write_voice_sample(job_id: str, jobs_dir: Path, req: TtsJobRequest) -> Path 
     sample_path.parent.mkdir(parents=True, exist_ok=True)
     sample_path.write_bytes(sample)
     return sample_path
+
+
+def stable_voice_seed(voice_sample_path: Path | None, req: TtsJobRequest) -> int:
+    if req.seed is not None:
+        return req.seed
+    configured = os.environ.get("EUTHERLINK_CLONED_VOICE_SEED", "").strip()
+    if configured:
+        try:
+            return int(configured) & 0x7FFF_FFFF
+        except ValueError:
+            pass
+    if voice_sample_path is None:
+        return 0
+    digest = hashlib.blake2s(voice_sample_path.read_bytes(), digest_size=8).digest()
+    return int.from_bytes(digest, "big") & 0x7FFF_FFFF
+
+
+def set_generation_seed(seed: int) -> None:
+    normalized = seed & 0x7FFF_FFFF
+    random.seed(normalized)
+    np.random.seed(normalized)
+    torch.manual_seed(normalized)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(normalized)
 
 
 def split_text(text: str, max_chars: int) -> list[str]:
