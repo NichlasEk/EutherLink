@@ -2,6 +2,8 @@
 from __future__ import annotations
 
 import argparse
+import base64
+import binascii
 import concurrent.futures
 import dataclasses
 import json
@@ -44,6 +46,9 @@ class TtsJobRequest(BaseModel):
     inference_timesteps: int = Field(default=10, ge=1, le=50)
     normalize: bool = False
     max_chunk_chars: int = Field(default=700, ge=120, le=1500)
+    prompt_wav_base64: str | None = Field(default=None, max_length=32_000_000)
+    reference_wav_base64: str | None = Field(default=None, max_length=32_000_000)
+    prompt_text: str | None = Field(default=None, max_length=500)
 
 
 class TtsJobAccepted(BaseModel):
@@ -179,6 +184,7 @@ class EutherLinkTts:
             wav_parts: list[np.ndarray] = []
             sample_rate = int(model.tts_model.sample_rate)
             silence = np.zeros(int(sample_rate * 0.35), dtype=np.float32)
+            voice_sample_path = write_voice_sample(job_id, self.jobs_dir, req)
 
             for index, chunk in enumerate(chunks, start=1):
                 progress = 0.05 + 0.85 * ((index - 1) / max(1, len(chunks)))
@@ -189,14 +195,20 @@ class EutherLinkTts:
                     message=f"Synthesizing chunk {index}/{len(chunks)}",
                 )
                 final_text = f"({req.voice_instruction}){chunk}" if req.voice_instruction.strip() else chunk
+                generate_kwargs: dict[str, object] = {
+                    "text": final_text,
+                    "cfg_value": req.cfg_value,
+                    "inference_timesteps": req.inference_timesteps,
+                    "normalize": req.normalize,
+                    "denoise": False,
+                }
+                if voice_sample_path is not None:
+                    generate_kwargs["prompt_wav_path"] = str(voice_sample_path)
+                    generate_kwargs["reference_wav_path"] = str(voice_sample_path)
+                    if req.prompt_text:
+                        generate_kwargs["prompt_text"] = req.prompt_text
                 with self.model_lock:
-                    wav = model.generate(
-                        text=final_text,
-                        cfg_value=req.cfg_value,
-                        inference_timesteps=req.inference_timesteps,
-                        normalize=req.normalize,
-                        denoise=False,
-                    )
+                    wav = model.generate(**generate_kwargs)
                 wav_parts.append(np.asarray(wav, dtype=np.float32))
                 if index != len(chunks):
                     wav_parts.append(silence)
@@ -228,6 +240,24 @@ class EutherLinkTts:
                 message="Failed",
                 error=f"{type(exc).__name__}: {exc}",
             )
+
+
+def write_voice_sample(job_id: str, jobs_dir: Path, req: TtsJobRequest) -> Path | None:
+    sample_base64 = req.prompt_wav_base64 or req.reference_wav_base64
+    if not sample_base64:
+        return None
+    try:
+        sample = base64.b64decode(sample_base64, validate=True)
+    except (binascii.Error, ValueError) as exc:
+        raise ValueError("Invalid voice sample audio") from exc
+    if not sample or len(sample) > 24 * 1024 * 1024:
+        raise ValueError("Voice sample audio is empty or too large")
+    if sample[:4] != b"RIFF" or sample[8:12] != b"WAVE":
+        raise ValueError("Voice sample must be WAV audio")
+    sample_path = jobs_dir / job_id / "voice-sample.wav"
+    sample_path.parent.mkdir(parents=True, exist_ok=True)
+    sample_path.write_bytes(sample)
+    return sample_path
 
 
 def split_text(text: str, max_chars: int) -> list[str]:
