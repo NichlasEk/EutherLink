@@ -8,6 +8,7 @@ import concurrent.futures
 import dataclasses
 import hashlib
 import json
+import logging
 import os
 import random
 import re
@@ -27,6 +28,8 @@ from pydantic import BaseModel, Field
 
 from voxcpm import VoxCPM
 
+
+LOGGER = logging.getLogger("eutherlink")
 
 DEFAULT_MODEL_PATH = (
     "/home/nichlas/.cache/huggingface/hub/models--openbmb--VoxCPM2/"
@@ -124,6 +127,21 @@ class EutherLinkTts:
         state = JobState(id=job_id, request=request)
         with self.jobs_lock:
             self.jobs[job_id] = state
+        LOGGER.warning(
+            "TTS_TRACE submit job=%s lang=%s fmt=%s text_len=%s text_sha=%s seed_request=%s cfg=%.3f steps=%s max_chunk_chars=%s has_prompt=%s has_reference=%s voice_instruction_sha=%s",
+            job_id,
+            request.language,
+            request.output_format,
+            len(request.text),
+            short_sha256(request.text.encode("utf-8")),
+            request.seed,
+            request.cfg_value,
+            request.inference_timesteps,
+            request.max_chunk_chars,
+            bool(request.prompt_wav_base64),
+            bool(request.reference_wav_base64),
+            short_sha256(request.voice_instruction.encode("utf-8")),
+        )
         self.executor.submit(self._run_job, job_id)
         return state
 
@@ -191,6 +209,21 @@ class EutherLinkTts:
             voice_sample_path = write_voice_sample(job_id, self.jobs_dir, req)
             cloned_cfg_value = min(req.cfg_value, float(os.environ.get("EUTHERLINK_CLONED_VOICE_MAX_CFG", "2.0")))
             cloned_seed = stable_voice_seed(voice_sample_path, req) if voice_sample_path is not None else None
+            sample_size = voice_sample_path.stat().st_size if voice_sample_path is not None else 0
+            sample_sha = file_short_sha256(voice_sample_path) if voice_sample_path is not None else ""
+            LOGGER.warning(
+                "TTS_TRACE run job=%s chunks=%s sample=%s sample_size=%s sample_sha=%s seed_request=%s seed_effective=%s cloned_cfg=%.3f prompt_text_len=%s prompt_text_sha=%s",
+                job_id,
+                len(chunks),
+                voice_sample_path is not None,
+                sample_size,
+                sample_sha,
+                req.seed,
+                cloned_seed,
+                cloned_cfg_value,
+                len(req.prompt_text or ""),
+                short_sha256((req.prompt_text or "").encode("utf-8")),
+            )
             prompt_cache: dict[str, Any] | None = None
             initial_prompt_cache: dict[str, Any] | None = None
             if voice_sample_path is not None:
@@ -205,6 +238,17 @@ class EutherLinkTts:
                 initial_prompt_cache = prompt_cache
 
             for index, chunk in enumerate(chunks, start=1):
+                LOGGER.warning(
+                    "TTS_TRACE chunk_start job=%s chunk=%s/%s text_len=%s text_sha=%s seed_effective=%s sample_sha=%s prompt_cache=%s",
+                    job_id,
+                    index,
+                    len(chunks),
+                    len(chunk),
+                    short_sha256(chunk.encode("utf-8")),
+                    cloned_seed,
+                    sample_sha,
+                    prompt_cache is not None,
+                )
                 progress = 0.05 + 0.85 * ((index - 1) / max(1, len(chunks)))
                 self._set_state(
                     job_id,
@@ -242,6 +286,14 @@ class EutherLinkTts:
                     }
                     with self.model_lock:
                         wav = model.generate(**generate_kwargs)
+                LOGGER.warning(
+                    "TTS_TRACE chunk_done job=%s chunk=%s/%s samples=%s peak=%.5f",
+                    job_id,
+                    index,
+                    len(chunks),
+                    len(wav),
+                    float(np.max(np.abs(wav))) if len(wav) else 0.0,
+                )
                 wav_parts.append(np.asarray(wav, dtype=np.float32))
                 if index != len(chunks):
                     wav_parts.append(silence)
@@ -265,7 +317,9 @@ class EutherLinkTts:
                 progress=1.0,
                 message=f"Done: {output_path.name}",
             )
+            LOGGER.warning("TTS_TRACE done job=%s output=%s", job_id, output_path)
         except Exception as exc:
+            LOGGER.exception("TTS_TRACE failed job=%s", job_id)
             self._set_state(
                 job_id,
                 status="failed",
@@ -291,6 +345,18 @@ def write_voice_sample(job_id: str, jobs_dir: Path, req: TtsJobRequest) -> Path 
     sample_path.parent.mkdir(parents=True, exist_ok=True)
     sample_path.write_bytes(sample)
     return sample_path
+
+
+def short_sha256(data: bytes) -> str:
+    return hashlib.sha256(data).hexdigest()[:16]
+
+
+def file_short_sha256(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as file:
+        for chunk in iter(lambda: file.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()[:16]
 
 
 def stable_voice_seed(voice_sample_path: Path | None, req: TtsJobRequest) -> int:
@@ -449,6 +515,7 @@ def status_response(state: JobState) -> TtsJobStatus:
 
 
 def main() -> None:
+    logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s %(message)s")
     parser = argparse.ArgumentParser(description="EutherLink local service host")
     parser.add_argument("--host", default=os.environ.get("EUTHERLINK_HOST", "0.0.0.0"))
     parser.add_argument("--port", type=int, default=int(os.environ.get("EUTHERLINK_PORT", "8765")))
