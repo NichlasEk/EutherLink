@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import re
 import sys
 import threading
@@ -20,6 +21,7 @@ DEFAULT_DOTS_ROOT = Path("/home/nichlas/ai/dots_tts/dots.tts")
 DEFAULT_OUTPUT_DIR = Path("/home/nichlas/EutherLink/data/dots-worker-artifacts")
 DEFAULT_MODEL_PATH = Path("/home/nichlas/ai/dots_tts/models/dots.tts-soar")
 DEFAULT_MAX_GENERATE_LENGTH = 500
+DEFAULT_STREAM_PART_SECONDS = 8.0
 
 
 class RenderRequest(BaseModel):
@@ -160,7 +162,8 @@ class DotsWorker:
         full_chunks: list[torch.Tensor] = []
         partial_paths: list[str] = []
         sample_rate = runtime.sample_rate
-        stream_group_size = 4
+        stream_part_samples = max(1, int(sample_rate * stream_part_seconds()))
+        stream_samples = 0
 
         for stream_index, tensor in enumerate(
             runtime.generate_stream(**self.service._build_runtime_generate_kwargs(normalized_request)),  # noqa: SLF001
@@ -169,12 +172,14 @@ class DotsWorker:
             cpu_tensor = tensor.detach().float().cpu()
             stream_chunks.append(cpu_tensor)
             full_chunks.append(cpu_tensor)
-            if len(stream_chunks) >= stream_group_size:
+            stream_samples += int(cpu_tensor.shape[-1])
+            if stream_samples >= stream_part_samples:
                 partial_paths.append(
                     self._write_partial_audio(partial_dir, chunk_index, len(partial_paths) + 1, stream_chunks, sample_rate)
                 )
                 progress_state["partials"] = partial_paths
                 stream_chunks = []
+                stream_samples = 0
                 self._write_progress(
                     progress_json,
                     chunk_index,
@@ -329,6 +334,16 @@ def create_app(worker: DotsWorker) -> FastAPI:
         return worker.render(Path(request.request_json), Path(request.output_dir), progress_json)
 
     return app
+
+
+def stream_part_seconds() -> float:
+    try:
+        value = float(os.environ.get("EUTHERLINK_DOTS_STREAM_PART_SECONDS", DEFAULT_STREAM_PART_SECONDS))
+    except ValueError:
+        return DEFAULT_STREAM_PART_SECONDS
+    if value != value:
+        return DEFAULT_STREAM_PART_SECONDS
+    return min(30.0, max(3.0, value))
 
 
 def main() -> None:
