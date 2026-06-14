@@ -5,7 +5,10 @@ import argparse
 import json
 import sys
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any
+
+import soundfile as sf
 
 
 DEFAULT_DOTS_ROOT = Path("/home/nichlas/ai/dots_tts/dots.tts")
@@ -41,8 +44,10 @@ def main() -> None:
 
     model_path = str(payload["model_path"])
     chunks = [str(chunk) for chunk in payload["chunks"]]
-    prompt_audio_path = str(payload["prompt_audio_path"])
-    prompt_text = str(payload["prompt_text"])
+    prompt_audio_value = payload.get("prompt_audio_path")
+    prompt_audio_path = str(prompt_audio_value).strip() if prompt_audio_value else None
+    prompt_text_value = payload.get("prompt_text")
+    prompt_text = str(prompt_text_value).strip() if prompt_text_value else None
     seed = int(payload.get("seed", 42))
 
     config = build_gradio_app_config(
@@ -73,7 +78,26 @@ def main() -> None:
             normalize_text=bool(payload.get("normalize_text", False)),
             seed=seed,
         )
-        result = service.generate(request)
+        if prompt_audio_path:
+            result = service.generate(request)
+        else:
+            from dots_tts.utils.util import seed_everything  # noqa: PLC0415
+
+            seed_everything(seed)
+            runtime, _resolved_model = service._get_runtime(model_path)  # noqa: SLF001
+            generation = runtime.generate(**service._build_runtime_generate_kwargs(request))  # noqa: SLF001
+            audio_path = output_dir / f"chunk_{index:03d}.wav"
+            sf.write(
+                audio_path,
+                generation["audio"].float().cpu().squeeze().numpy(),
+                int(generation["sample_rate"]),
+                subtype="PCM_16",
+            )
+            result = SimpleNamespace(
+                audio_path=str(audio_path),
+                metrics={"execution_mode": config.execution_mode, "random_voice": True},
+                status="success",
+            )
         rendered_chunks.append(
             {
                 "index": index,

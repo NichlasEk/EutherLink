@@ -79,8 +79,10 @@ class DotsWorker:
 
         model_path = str(payload["model_path"])
         chunks = [str(chunk) for chunk in payload["chunks"]]
-        prompt_audio_path = str(payload["prompt_audio_path"])
-        prompt_text = str(payload["prompt_text"])
+        prompt_audio_value = payload.get("prompt_audio_path")
+        prompt_audio_path = str(prompt_audio_value).strip() if prompt_audio_value else None
+        prompt_text_value = payload.get("prompt_text")
+        prompt_text = str(prompt_text_value).strip() if prompt_text_value else None
         seed = int(payload.get("seed", 42))
 
         rendered_chunks: list[dict[str, Any]] = []
@@ -171,7 +173,7 @@ class DotsWorker:
         from dots_tts.utils.util import seed_everything
 
         started = time.perf_counter()
-        normalized_request = self.service._normalize_request(request)  # noqa: SLF001
+        normalized_request = self.service._normalize_request(request) if request.prompt_audio_path else request  # noqa: SLF001
         seed_everything(normalized_request.seed)
         runtime_start = time.perf_counter()
         runtime, resolved_model = self.service._get_runtime(normalized_request.model_name_or_path)  # noqa: SLF001

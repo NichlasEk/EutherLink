@@ -616,9 +616,7 @@ class EutherLinkTts:
         voice_sample_path: Path | None,
     ) -> None:
         dots_started = time.perf_counter()
-        if voice_sample_path is None:
-            raise ValueError(f"{req.model_backend} requires prompt_wav_base64 or reference_wav_base64")
-        if not (req.prompt_text or "").strip():
+        if voice_sample_path is not None and not (req.prompt_text or "").strip():
             raise ValueError(f"{req.model_backend} requires prompt_text matching the prompt audio")
 
         job_dir = self.jobs_dir / job_id
@@ -629,12 +627,12 @@ class EutherLinkTts:
         model_path = dots_model_path(req.model_backend)
         language = dots_language(req.language)
         max_generate_length = req.dots_max_generate_length
-        prompt_audio_path = prepare_dots_prompt_audio(voice_sample_path, job_dir)
+        prompt_audio_path = prepare_dots_prompt_audio(voice_sample_path, job_dir) if voice_sample_path is not None else None
         payload = {
             "model_path": model_path,
             "chunks": chunks,
-            "prompt_audio_path": str(prompt_audio_path),
-            "prompt_text": req.prompt_text,
+            "prompt_audio_path": str(prompt_audio_path) if prompt_audio_path is not None else None,
+            "prompt_text": req.prompt_text if prompt_audio_path is not None else None,
             "language": language,
             "seed": seed,
             "template_name": req.dots_template_name,
@@ -648,7 +646,7 @@ class EutherLinkTts:
         }
         request_path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
         LOGGER.warning(
-            "TTS_TRACE dots_start job=%s backend=%s chunks=%s max_words=%s seed_effective=%s model=%s language=%s template=%s ode=%s steps=%s guidance=%.3f speaker=%.3f max_len=%s prompt_sha=%s",
+            "TTS_TRACE dots_start job=%s backend=%s chunks=%s max_words=%s seed_effective=%s model=%s language=%s template=%s ode=%s steps=%s guidance=%.3f speaker=%.3f max_len=%s has_prompt=%s prompt_sha=%s voice_instruction_sha=%s",
             job_id,
             req.model_backend,
             len(chunks),
@@ -662,7 +660,9 @@ class EutherLinkTts:
             req.dots_guidance_scale,
             req.dots_speaker_scale,
             max_generate_length,
-            file_short_sha256(prompt_audio_path),
+            prompt_audio_path is not None,
+            file_short_sha256(prompt_audio_path) if prompt_audio_path is not None else "",
+            short_sha256(req.voice_instruction.encode("utf-8")),
         )
         self._set_state(
             job_id,
