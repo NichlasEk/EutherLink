@@ -42,6 +42,8 @@ DOTS_TTS_SOAR_PATH = "/home/nichlas/ai/dots_tts/models/dots.tts-soar"
 
 OutputFormat = Literal["wav", "mp3", "opus"]
 ModelBackend = Literal["voxcpm2", "dots.tts-soar"]
+DotsTemplateName = Literal["tts", "instruction_tts", "text_to_audio", "tts_interleave"]
+DotsOdeMethod = Literal["euler", "midpoint"]
 
 
 class TtsJobRequest(BaseModel):
@@ -57,6 +59,12 @@ class TtsJobRequest(BaseModel):
     inference_timesteps: int = Field(default=10, ge=1, le=50)
     normalize: bool = False
     max_chunk_chars: int = Field(default=700, ge=120, le=1500)
+    dots_template_name: DotsTemplateName = "tts"
+    dots_ode_method: DotsOdeMethod = "euler"
+    dots_num_steps: int = Field(default=10, ge=1, le=50)
+    dots_guidance_scale: float = Field(default=1.2, ge=0.0, le=5.0)
+    dots_speaker_scale: float = Field(default=1.5, ge=0.0, le=5.0)
+    dots_max_generate_length: int = Field(default=500, ge=128, le=4096)
     prompt_wav_base64: str | None = Field(default=None, max_length=32_000_000)
     reference_wav_base64: str | None = Field(default=None, max_length=32_000_000)
     prompt_text: str | None = Field(default=None, max_length=500)
@@ -133,8 +141,9 @@ class EutherLinkTts:
         with self.jobs_lock:
             self.jobs[job_id] = state
         LOGGER.warning(
-            "TTS_TRACE submit job=%s lang=%s fmt=%s text_len=%s text_sha=%s seed_request=%s cfg=%.3f steps=%s max_chunk_chars=%s has_prompt=%s has_reference=%s voice_instruction_sha=%s",
+            "TTS_TRACE submit job=%s backend=%s lang=%s fmt=%s text_len=%s text_sha=%s seed_request=%s cfg=%.3f steps=%s dots_guidance=%.3f dots_speaker=%.3f dots_steps=%s dots_max_len=%s max_chunk_chars=%s has_prompt=%s has_reference=%s voice_instruction_sha=%s",
             job_id,
+            request.model_backend,
             request.language,
             request.output_format,
             len(request.text),
@@ -142,6 +151,10 @@ class EutherLinkTts:
             request.seed,
             request.cfg_value,
             request.inference_timesteps,
+            request.dots_guidance_scale,
+            request.dots_speaker_scale,
+            request.dots_num_steps,
+            request.dots_max_generate_length,
             request.max_chunk_chars,
             bool(request.prompt_wav_base64),
             bool(request.reference_wav_base64),
@@ -364,17 +377,27 @@ class EutherLinkTts:
             "prompt_text": req.prompt_text,
             "language": req.language,
             "seed": seed,
-            "num_steps": req.inference_timesteps,
-            "guidance_scale": req.cfg_value,
+            "template_name": req.dots_template_name,
+            "ode_method": req.dots_ode_method,
+            "num_steps": req.dots_num_steps,
+            "guidance_scale": req.dots_guidance_scale,
+            "speaker_scale": req.dots_speaker_scale,
+            "max_generate_length": req.dots_max_generate_length,
             "normalize_text": req.normalize,
         }
         request_path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
         LOGGER.warning(
-            "TTS_TRACE dots_start job=%s chunks=%s seed_effective=%s model=%s prompt_sha=%s",
+            "TTS_TRACE dots_start job=%s chunks=%s seed_effective=%s model=%s template=%s ode=%s steps=%s guidance=%.3f speaker=%.3f max_len=%s prompt_sha=%s",
             job_id,
             len(chunks),
             seed,
             model_path,
+            req.dots_template_name,
+            req.dots_ode_method,
+            req.dots_num_steps,
+            req.dots_guidance_scale,
+            req.dots_speaker_scale,
+            req.dots_max_generate_length,
             file_short_sha256(voice_sample_path),
         )
         self._set_state(
