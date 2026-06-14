@@ -43,10 +43,10 @@ DOTS_TTS_RENDERER = "/home/nichlas/EutherLink/scripts/render_dots_tts.py"
 DOTS_TTS_WORKER = "/home/nichlas/EutherLink/scripts/dots_tts_worker.py"
 DOTS_TTS_SOAR_PATH = "/home/nichlas/ai/dots_tts/models/dots.tts-soar"
 DOTS_TTS_WORKER_URL = "http://127.0.0.1:18765"
-DOTS_TTS_MAX_WORDS = 180
-DOTS_TTS_MIN_WORDS = 45
-DOTS_TTS_MODEL_MAX_WORDS = 200
-DOTS_TTS_DEFAULT_GENERATE_LENGTH = 500
+DOTS_TTS_MAX_WORDS = 60
+DOTS_TTS_MIN_WORDS = 20
+DOTS_TTS_MODEL_MAX_WORDS = 80
+DOTS_TTS_DEFAULT_GENERATE_LENGTH = 256
 DOTS_TTS_SAMPLE_RATE = 48_000
 PREWARM_DOTS_DEFAULT = "1"
 
@@ -161,7 +161,7 @@ class EutherLinkTts:
 
             worker_env = os.environ.copy()
             worker_env.setdefault("NUMBA_CACHE_DIR", str(self.config.data_dir / "numba-cache"))
-            dots_generate_length = max(DOTS_TTS_DEFAULT_GENERATE_LENGTH, int(os.environ.get("EUTHERLINK_DOTS_TTS_MAX_GENERATE_LENGTH", DOTS_TTS_DEFAULT_GENERATE_LENGTH)))
+            dots_generate_length = int(os.environ.get("EUTHERLINK_DOTS_TTS_MAX_GENERATE_LENGTH", DOTS_TTS_DEFAULT_GENERATE_LENGTH))
             self.dots_worker_process = subprocess.Popen(
                 [
                     os.environ.get("EUTHERLINK_DOTS_TTS_PYTHON", DOTS_TTS_PYTHON),
@@ -550,7 +550,7 @@ class EutherLinkTts:
         seed = stable_voice_seed(voice_sample_path, req)
         model_path = os.environ.get("EUTHERLINK_DOTS_TTS_SOAR_PATH", DOTS_TTS_SOAR_PATH)
         language = dots_language(req.language)
-        max_generate_length = max(DOTS_TTS_DEFAULT_GENERATE_LENGTH, req.dots_max_generate_length)
+        max_generate_length = DOTS_TTS_DEFAULT_GENERATE_LENGTH
         prompt_audio_path = prepare_dots_prompt_audio(voice_sample_path, job_dir)
         payload = {
             "model_path": model_path,
