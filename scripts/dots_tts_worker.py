@@ -223,7 +223,7 @@ class DotsWorker:
     def _write_partial_audio(partial_dir: Path, chunk_index: int, partial_index: int, chunks: list[torch.Tensor], sample_rate: int) -> str:
         audio = torch.cat(chunks, dim=-1).squeeze().numpy()
         path = partial_dir / f"chunk-{chunk_index:03d}-part-{partial_index:03d}.wav"
-        temp_path = path.with_name(f".{path.name}.tmp")
+        temp_path = path.with_name(f".{path.stem}.tmp.wav")
         sf.write(temp_path, audio, sample_rate, subtype="PCM_16")
         temp_path.replace(path)
         return path.name
