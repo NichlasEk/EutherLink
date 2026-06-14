@@ -46,6 +46,7 @@ DOTS_TTS_WORKER_URL = "http://127.0.0.1:18765"
 DOTS_TTS_MAX_WORDS = 180
 DOTS_TTS_MIN_GENERATE_LENGTH = 500
 DOTS_TTS_SAMPLE_RATE = 48_000
+PREWARM_DOTS_DEFAULT = "1"
 
 OutputFormat = Literal["wav", "mp3", "opus"]
 ModelBackend = Literal["voxcpm2", "dots.tts-soar"]
@@ -188,6 +189,44 @@ class EutherLinkTts:
                 return response.status == 200
         except (OSError, urllib.error.URLError):
             return False
+
+    def dots_worker_status(self) -> dict[str, object]:
+        try:
+            with urllib.request.urlopen(f"{DOTS_TTS_WORKER_URL}/health", timeout=0.5) as response:
+                payload = json.loads(response.read().decode("utf-8"))
+        except Exception:
+            process_running = self.dots_worker_process is not None and self.dots_worker_process.poll() is None
+            return {
+                "ok": False,
+                "status": "starting" if process_running else "offline",
+                "model_loaded": False,
+            }
+
+        model_loaded = bool(payload.get("model_loaded"))
+        return {
+            "ok": True,
+            "status": "ready" if model_loaded else "warming",
+            "model_loaded": model_loaded,
+            "loaded_model": payload.get("loaded_model"),
+            "precision": payload.get("precision"),
+            "max_generate_length": payload.get("max_generate_length"),
+        }
+
+    def prewarm_dots_worker(self) -> None:
+        try:
+            self.ensure_dots_worker()
+            request = urllib.request.Request(
+                f"{DOTS_TTS_WORKER_URL}/preload",
+                data=b"{}",
+                headers={"Content-Type": "application/json"},
+                method="POST",
+            )
+            with urllib.request.urlopen(request, timeout=None) as response:
+                if response.status != 200:
+                    raise RuntimeError(f"dots.tts preload returned HTTP {response.status}")
+            LOGGER.warning("TTS_TRACE dots_prewarm_done")
+        except Exception:
+            LOGGER.exception("TTS_TRACE dots_prewarm_failed")
 
     def render_dots_with_worker(self, request_path: Path, dots_dir: Path) -> None:
         self.ensure_dots_worker()
@@ -702,6 +741,12 @@ def encode_audio(wav_path: Path, output_path: Path, output_format: OutputFormat)
 def build_app(service: EutherLinkTts) -> FastAPI:
     app = FastAPI(title="EutherLink", version="0.1.0")
 
+    @app.on_event("startup")
+    def prewarm_models() -> None:
+        prewarm_dots = os.environ.get("EUTHERLINK_PREWARM_DOTS", PREWARM_DOTS_DEFAULT).strip().lower()
+        if prewarm_dots in {"1", "true", "yes", "on"}:
+            threading.Thread(target=service.prewarm_dots_worker, name="dots-tts-prewarm", daemon=True).start()
+
     @app.get("/health")
     def health() -> dict[str, object]:
         return {
@@ -709,6 +754,7 @@ def build_app(service: EutherLinkTts) -> FastAPI:
             "service": "EutherLink",
             "model": service.config.model_path,
             "queued_or_running": sum(1 for job in service.jobs.values() if job.status in {"queued", "loading", "running"}),
+            "dots_tts": service.dots_worker_status(),
         }
 
     @app.post("/v1/tts/jobs", response_model=TtsJobAccepted)

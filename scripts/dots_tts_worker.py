@@ -49,6 +49,15 @@ class DotsWorker:
         )
         return GradioAppService(config)
 
+    def preload(self) -> dict[str, Any]:
+        with self.lock:
+            _, resolved_model_path = self.service._get_runtime(str(DEFAULT_MODEL_PATH))
+        return {
+            "ok": True,
+            "model_loaded": True,
+            "loaded_model": resolved_model_path,
+        }
+
     def render(self, request_json: Path, output_dir: Path) -> dict[str, Any]:
         from apps.gradio.service import SynthesisRequest
 
@@ -116,6 +125,10 @@ def create_app(worker: DotsWorker) -> FastAPI:
             "precision": metadata.get("configured_precision"),
             "max_generate_length": metadata.get("configured_max_generate_length"),
         }
+
+    @app.post("/preload")
+    def preload() -> dict[str, Any]:
+        return worker.preload()
 
     @app.post("/render")
     def render(request: RenderRequest) -> dict[str, Any]:
