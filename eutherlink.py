@@ -416,6 +416,8 @@ class EutherLinkTts:
             progress=0.05,
             message=f"Synthesizing {len(chunks)} chunk(s) with dots.tts-soar",
         )
+        dots_env = os.environ.copy()
+        dots_env.setdefault("NUMBA_CACHE_DIR", str(self.config.data_dir / "numba-cache"))
         subprocess.run(
             [
                 os.environ.get("EUTHERLINK_DOTS_TTS_PYTHON", DOTS_TTS_PYTHON),
@@ -425,6 +427,7 @@ class EutherLinkTts:
             ],
             check=True,
             cwd=str(Path(DOTS_TTS_RENDERER).resolve().parent),
+            env=dots_env,
         )
 
         manifest_path = dots_dir / "manifest.json"
