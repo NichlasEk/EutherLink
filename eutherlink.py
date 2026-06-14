@@ -44,6 +44,7 @@ DOTS_TTS_WORKER = "/home/nichlas/EutherLink/scripts/dots_tts_worker.py"
 DOTS_TTS_SOAR_PATH = "/home/nichlas/ai/dots_tts/models/dots.tts-soar"
 DOTS_TTS_WORKER_URL = "http://127.0.0.1:18765"
 DOTS_TTS_MAX_WORDS = 180
+DOTS_TTS_MIN_WORDS = 45
 DOTS_TTS_DEFAULT_GENERATE_LENGTH = 128
 DOTS_TTS_SAMPLE_RATE = 48_000
 PREWARM_DOTS_DEFAULT = "1"
@@ -230,14 +231,32 @@ class EutherLinkTts:
         except Exception:
             LOGGER.exception("TTS_TRACE dots_prewarm_failed")
 
-    def render_dots_with_worker(self, request_path: Path, dots_dir: Path) -> None:
+    def render_dots_with_worker(self, job_id: str, request_path: Path, dots_dir: Path) -> None:
         self.ensure_dots_worker()
+        progress_path = dots_dir / "progress.json"
         payload = json.dumps(
             {
                 "request_json": str(request_path),
                 "output_dir": str(dots_dir),
+                "progress_json": str(progress_path),
             }
         ).encode("utf-8")
+        with concurrent.futures.ThreadPoolExecutor(max_workers=1) as executor:
+            future = executor.submit(self._post_dots_render, payload)
+            last_progress_signature: tuple[int, int, str] | None = None
+            while True:
+                try:
+                    response_status = future.result(timeout=0.5)
+                    if response_status != 200:
+                        raise RuntimeError(f"dots.tts worker returned HTTP {response_status}")
+                    self._sync_dots_progress(job_id, progress_path, force=True)
+                    return
+                except concurrent.futures.TimeoutError:
+                    signature = self._sync_dots_progress(job_id, progress_path, last_progress_signature)
+                    if signature is not None:
+                        last_progress_signature = signature
+
+    def _post_dots_render(self, payload: bytes) -> int:
         request = urllib.request.Request(
             f"{DOTS_TTS_WORKER_URL}/render",
             data=payload,
@@ -245,8 +264,44 @@ class EutherLinkTts:
             method="POST",
         )
         with urllib.request.urlopen(request, timeout=None) as response:
-            if response.status != 200:
-                raise RuntimeError(f"dots.tts worker returned HTTP {response.status}")
+            return int(response.status)
+
+    def _sync_dots_progress(
+        self,
+        job_id: str,
+        progress_path: Path,
+        last_signature: tuple[int, int, str] | None = None,
+        *,
+        force: bool = False,
+    ) -> tuple[int, int, str] | None:
+        if not progress_path.exists():
+            return None
+        try:
+            data = json.loads(progress_path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            return None
+        index = int(data.get("chunk_index") or 0)
+        total = max(1, int(data.get("chunk_total") or 1))
+        status = str(data.get("status") or "")
+        signature = (index, total, status)
+        if not force and signature == last_signature:
+            return signature
+        chunk_progress = 0.0
+        if status == "done":
+            chunk_progress = 1.0
+        elif status == "running":
+            chunk_progress = 0.5
+        elif status == "queued":
+            chunk_progress = 0.05
+        completed = max(0, index - 1) + chunk_progress
+        progress = 0.05 + 0.9 * min(1.0, completed / total)
+        self._set_state(
+            job_id,
+            status="running",
+            progress=progress,
+            message=f"dots.tts-soar chunk {min(index, total)}/{total} {status}".strip(),
+        )
+        return signature
 
     def submit(self, request: TtsJobRequest) -> JobState:
         job_id = uuid.uuid4().hex
@@ -528,7 +583,7 @@ class EutherLinkTts:
             progress=0.05,
             message=f"Synthesizing {len(chunks)} chunk(s) with dots.tts-soar",
         )
-        self.render_dots_with_worker(request_path, dots_dir)
+        self.render_dots_with_worker(job_id, request_path, dots_dir)
 
         manifest_path = dots_dir / "manifest.json"
         manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
@@ -675,15 +730,25 @@ def split_dots_text(text: str, max_chars: int, max_words: int) -> list[str]:
         if word_count(chunk) <= max_words:
             chunks.append(chunk)
             continue
-        chunks.extend(split_text_by_words(chunk, max_words))
+        chunks.extend(split_text_by_words(chunk, max_words, DOTS_TTS_MIN_WORDS))
     return chunks
 
 
-def split_text_by_words(text: str, max_words: int) -> list[str]:
+def split_text_by_words(text: str, max_words: int, min_words: int = 0) -> list[str]:
     words = re.findall(r"\S+", text.strip())
     if not words:
         return []
-    return [" ".join(words[index : index + max_words]) for index in range(0, len(words), max_words)]
+    chunks = [words[index : index + max_words] for index in range(0, len(words), max_words)]
+    if len(chunks) > 1 and min_words > 0 and len(chunks[-1]) < min_words:
+        tail = chunks.pop()
+        if len(chunks[-1]) + len(tail) <= max_words + min_words:
+            chunks[-1].extend(tail)
+        else:
+            split_at = (len(chunks[-1]) + len(tail)) // 2
+            combined = chunks[-1] + tail
+            chunks[-1] = combined[:split_at]
+            chunks.append(combined[split_at:])
+    return [" ".join(chunk) for chunk in chunks]
 
 
 def word_count(text: str) -> int:

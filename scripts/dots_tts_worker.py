@@ -22,6 +22,7 @@ DEFAULT_MAX_GENERATE_LENGTH = 128
 class RenderRequest(BaseModel):
     request_json: str
     output_dir: str
+    progress_json: str | None = None
 
 
 class DotsWorker:
@@ -60,11 +61,13 @@ class DotsWorker:
             "loaded_model": resolved_model_path,
         }
 
-    def render(self, request_json: Path, output_dir: Path) -> dict[str, Any]:
+    def render(self, request_json: Path, output_dir: Path, progress_json: Path | None = None) -> dict[str, Any]:
         from apps.gradio.service import SynthesisRequest
 
         payload = json.loads(request_json.read_text(encoding="utf-8"))
         output_dir.mkdir(parents=True, exist_ok=True)
+        if progress_json is not None:
+            progress_json.parent.mkdir(parents=True, exist_ok=True)
 
         model_path = str(payload["model_path"])
         chunks = [str(chunk) for chunk in payload["chunks"]]
@@ -75,6 +78,7 @@ class DotsWorker:
         rendered_chunks: list[dict[str, Any]] = []
         with self.lock:
             for index, chunk in enumerate(chunks, start=1):
+                self._write_progress(progress_json, index, len(chunks), "running")
                 request = SynthesisRequest(
                     model_name_or_path=model_path,
                     text=chunk,
@@ -91,6 +95,7 @@ class DotsWorker:
                     seed=seed,
                 )
                 result = self.service.generate(request)
+                self._write_progress(progress_json, index, len(chunks), "done")
                 rendered_chunks.append(
                     {
                         "index": index,
@@ -113,6 +118,22 @@ class DotsWorker:
         )
         return {"ok": True, "manifest_path": str(manifest_path)}
 
+    @staticmethod
+    def _write_progress(progress_json: Path | None, chunk_index: int, chunk_total: int, status: str) -> None:
+        if progress_json is None:
+            return
+        progress_json.write_text(
+            json.dumps(
+                {
+                    "chunk_index": chunk_index,
+                    "chunk_total": chunk_total,
+                    "status": status,
+                },
+                ensure_ascii=False,
+            ),
+            encoding="utf-8",
+        )
+
 
 def create_app(worker: DotsWorker) -> FastAPI:
     app = FastAPI(title="EutherLink Dots TTS Worker")
@@ -134,7 +155,8 @@ def create_app(worker: DotsWorker) -> FastAPI:
 
     @app.post("/render")
     def render(request: RenderRequest) -> dict[str, Any]:
-        return worker.render(Path(request.request_json), Path(request.output_dir))
+        progress_json = Path(request.progress_json) if request.progress_json else None
+        return worker.render(Path(request.request_json), Path(request.output_dir), progress_json)
 
     return app
 
