@@ -36,8 +36,12 @@ DEFAULT_MODEL_PATH = (
     "snapshots/e8b928065859f2869644c1e2881cbd21f888c659"
 )
 DEFAULT_DATA_DIR = "/home/nichlas/EutherLink/data"
+DOTS_TTS_PYTHON = "/home/nichlas/ai/dots_tts/dots.tts/.venv/bin/python"
+DOTS_TTS_RENDERER = "/home/nichlas/EutherLink/scripts/render_dots_tts.py"
+DOTS_TTS_SOAR_PATH = "/home/nichlas/ai/dots_tts/models/dots.tts-soar"
 
 OutputFormat = Literal["wav", "mp3", "opus"]
+ModelBackend = Literal["voxcpm2", "dots.tts-soar"]
 
 
 class TtsJobRequest(BaseModel):
@@ -48,6 +52,7 @@ class TtsJobRequest(BaseModel):
     )
     language: str = Field(default="sv", max_length=16)
     output_format: OutputFormat = "opus"
+    model_backend: ModelBackend = "voxcpm2"
     cfg_value: float = Field(default=2.0, ge=1.0, le=3.0)
     inference_timesteps: int = Field(default=10, ge=1, le=50)
     normalize: bool = False
@@ -196,40 +201,47 @@ class EutherLinkTts:
         try:
             state = self.get(job_id)
             req = state.request
-            self._set_state(job_id, status="loading", progress=0.01, message="Loading VoxCPM2")
-            model = self.load_model()
+            self._set_state(job_id, status="loading", progress=0.01, message="Preparing TTS job")
 
             chunks = split_text(req.text, req.max_chunk_chars)
             if not chunks:
                 raise ValueError("No text to synthesize")
 
+            voice_sample_path = write_voice_sample(job_id, self.jobs_dir, req)
+            if req.model_backend == "dots.tts-soar":
+                self._run_dots_tts_job(job_id, req, chunks, voice_sample_path)
+                return
+
+            self._set_state(job_id, status="loading", progress=0.01, message="Loading VoxCPM2")
+            model = self.load_model()
+
             wav_parts: list[np.ndarray] = []
             sample_rate = int(model.tts_model.sample_rate)
             silence = np.zeros(int(sample_rate * 0.35), dtype=np.float32)
-            voice_sample_path = write_voice_sample(job_id, self.jobs_dir, req)
             cloned_cfg_value = min(req.cfg_value, float(os.environ.get("EUTHERLINK_CLONED_VOICE_MAX_CFG", "2.0")))
-            cloned_seed = stable_voice_seed(voice_sample_path, req) if voice_sample_path is not None else None
+            job_seed = stable_voice_seed(voice_sample_path, req) if voice_sample_path is not None or req.seed is not None else None
             sample_size = voice_sample_path.stat().st_size if voice_sample_path is not None else 0
             sample_sha = file_short_sha256(voice_sample_path) if voice_sample_path is not None else ""
             LOGGER.warning(
-                "TTS_TRACE run job=%s chunks=%s sample=%s sample_size=%s sample_sha=%s seed_request=%s seed_effective=%s cloned_cfg=%.3f prompt_text_len=%s prompt_text_sha=%s",
+                "TTS_TRACE run job=%s chunks=%s sample=%s sample_size=%s sample_sha=%s seed_request=%s seed_effective=%s seed_mode=%s cloned_cfg=%.3f prompt_text_len=%s prompt_text_sha=%s",
                 job_id,
                 len(chunks),
                 voice_sample_path is not None,
                 sample_size,
                 sample_sha,
                 req.seed,
-                cloned_seed,
+                job_seed,
+                "job_once" if job_seed is not None else "none",
                 cloned_cfg_value,
                 len(req.prompt_text or ""),
                 short_sha256((req.prompt_text or "").encode("utf-8")),
             )
             prompt_cache: dict[str, Any] | None = None
             initial_prompt_cache: dict[str, Any] | None = None
+            if job_seed is not None:
+                set_generation_seed(job_seed)
             if voice_sample_path is not None:
                 with self.model_lock:
-                    if cloned_seed is not None:
-                        set_generation_seed(cloned_seed)
                     prompt_cache = model.tts_model.build_prompt_cache(
                         prompt_text=req.prompt_text if req.prompt_text else None,
                         prompt_wav_path=str(voice_sample_path) if req.prompt_text else None,
@@ -239,13 +251,14 @@ class EutherLinkTts:
 
             for index, chunk in enumerate(chunks, start=1):
                 LOGGER.warning(
-                    "TTS_TRACE chunk_start job=%s chunk=%s/%s text_len=%s text_sha=%s seed_effective=%s sample_sha=%s prompt_cache=%s",
+                    "TTS_TRACE chunk_start job=%s chunk=%s/%s text_len=%s text_sha=%s seed_effective=%s seed_mode=%s sample_sha=%s prompt_cache=%s",
                     job_id,
                     index,
                     len(chunks),
                     len(chunk),
                     short_sha256(chunk.encode("utf-8")),
-                    cloned_seed,
+                    job_seed,
+                    "job_once" if job_seed is not None else "none",
                     sample_sha,
                     prompt_cache is not None,
                 )
@@ -258,8 +271,6 @@ class EutherLinkTts:
                 )
                 if voice_sample_path is not None:
                     with self.model_lock:
-                        if cloned_seed is not None:
-                            set_generation_seed(cloned_seed)
                         wav_tensor, _text_tokens, new_audio_feat = model.tts_model.generate_with_prompt_cache(
                             target_text=chunk,
                             prompt_cache=prompt_cache,
@@ -327,6 +338,97 @@ class EutherLinkTts:
                 message="Failed",
                 error=f"{type(exc).__name__}: {exc}",
             )
+
+    def _run_dots_tts_job(
+        self,
+        job_id: str,
+        req: TtsJobRequest,
+        chunks: list[str],
+        voice_sample_path: Path | None,
+    ) -> None:
+        if voice_sample_path is None:
+            raise ValueError("dots.tts-soar requires prompt_wav_base64 or reference_wav_base64")
+        if not (req.prompt_text or "").strip():
+            raise ValueError("dots.tts-soar requires prompt_text matching the prompt audio")
+
+        job_dir = self.jobs_dir / job_id
+        dots_dir = job_dir / "dots.tts-soar"
+        request_path = dots_dir / "request.json"
+        dots_dir.mkdir(parents=True, exist_ok=True)
+        seed = stable_voice_seed(voice_sample_path, req)
+        model_path = os.environ.get("EUTHERLINK_DOTS_TTS_SOAR_PATH", DOTS_TTS_SOAR_PATH)
+        payload = {
+            "model_path": model_path,
+            "chunks": chunks,
+            "prompt_audio_path": str(voice_sample_path),
+            "prompt_text": req.prompt_text,
+            "language": req.language,
+            "seed": seed,
+            "num_steps": req.inference_timesteps,
+            "guidance_scale": req.cfg_value,
+            "normalize_text": req.normalize,
+        }
+        request_path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+        LOGGER.warning(
+            "TTS_TRACE dots_start job=%s chunks=%s seed_effective=%s model=%s prompt_sha=%s",
+            job_id,
+            len(chunks),
+            seed,
+            model_path,
+            file_short_sha256(voice_sample_path),
+        )
+        self._set_state(
+            job_id,
+            status="running",
+            progress=0.05,
+            message=f"Synthesizing {len(chunks)} chunk(s) with dots.tts-soar",
+        )
+        subprocess.run(
+            [
+                os.environ.get("EUTHERLINK_DOTS_TTS_PYTHON", DOTS_TTS_PYTHON),
+                os.environ.get("EUTHERLINK_DOTS_TTS_RENDERER", DOTS_TTS_RENDERER),
+                str(request_path),
+                str(dots_dir),
+            ],
+            check=True,
+            cwd=str(Path(DOTS_TTS_RENDERER).resolve().parent),
+        )
+
+        manifest_path = dots_dir / "manifest.json"
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+        wav_parts: list[np.ndarray] = []
+        sample_rate: int | None = None
+        silence = np.zeros(0, dtype=np.float32)
+        for index, rendered in enumerate(manifest["chunks"], start=1):
+            wav, rate = sf.read(rendered["audio_path"], dtype="float32")
+            if wav.ndim > 1:
+                wav = wav.mean(axis=1)
+            if sample_rate is None:
+                sample_rate = int(rate)
+                silence = np.zeros(int(sample_rate * 0.35), dtype=np.float32)
+            elif sample_rate != int(rate):
+                raise ValueError(f"dots.tts chunk sample-rate mismatch: {sample_rate} != {rate}")
+            wav_parts.append(np.asarray(wav, dtype=np.float32))
+            if index != len(manifest["chunks"]):
+                wav_parts.append(silence)
+
+        if sample_rate is None:
+            raise ValueError("dots.tts did not render any audio")
+        audio = normalize_peak(np.concatenate(wav_parts))
+        wav_path = job_dir / "audio.wav"
+        sf.write(wav_path, audio, sample_rate, subtype="PCM_16")
+        output_path = job_dir / f"audio.{req.output_format}"
+        if req.output_format == "wav":
+            output_path = wav_path
+        else:
+            encode_audio(wav_path, output_path, req.output_format)
+        self._set_state(
+            job_id,
+            status="done",
+            progress=1.0,
+            message=f"Done: {output_path.name}",
+        )
+        LOGGER.warning("TTS_TRACE dots_done job=%s output=%s", job_id, output_path)
 
 
 def write_voice_sample(job_id: str, jobs_dir: Path, req: TtsJobRequest) -> Path | None:
