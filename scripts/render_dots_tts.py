@@ -5,7 +5,6 @@ import argparse
 import json
 import sys
 from pathlib import Path
-from types import SimpleNamespace
 from typing import Any
 
 import soundfile as sf
@@ -60,6 +59,20 @@ def main() -> None:
         repo_root=dots_root,
     )
     service = GradioAppService(config)
+    if prompt_audio_path is None:
+        prompt_audio_path, prompt_text = generate_preset_prompt_audio(
+            service=service,
+            model_path=model_path,
+            output_dir=output_dir,
+            language=payload.get("language") or None,
+            template_name=str(payload.get("template_name", "tts")),
+            ode_method=str(payload.get("ode_method", "euler")),
+            num_steps=int(payload.get("num_steps", 10)),
+            guidance_scale=float(payload.get("guidance_scale", 1.2)),
+            speaker_scale=float(payload.get("speaker_scale", 1.5)),
+            normalize_text=bool(payload.get("normalize_text", False)),
+            seed=seed,
+        )
 
     rendered_chunks: list[dict[str, Any]] = []
     for index, chunk in enumerate(chunks, start=1):
@@ -78,26 +91,7 @@ def main() -> None:
             normalize_text=bool(payload.get("normalize_text", False)),
             seed=seed,
         )
-        if prompt_audio_path:
-            result = service.generate(request)
-        else:
-            from dots_tts.utils.util import seed_everything  # noqa: PLC0415
-
-            seed_everything(seed)
-            runtime, _resolved_model = service._get_runtime(model_path)  # noqa: SLF001
-            generation = runtime.generate(**service._build_runtime_generate_kwargs(request))  # noqa: SLF001
-            audio_path = output_dir / f"chunk_{index:03d}.wav"
-            sf.write(
-                audio_path,
-                generation["audio"].float().cpu().squeeze().numpy(),
-                int(generation["sample_rate"]),
-                subtype="PCM_16",
-            )
-            result = SimpleNamespace(
-                audio_path=str(audio_path),
-                metrics={"execution_mode": config.execution_mode, "random_voice": True},
-                status="success",
-            )
+        result = service.generate(request)
         rendered_chunks.append(
             {
                 "index": index,
@@ -116,6 +110,64 @@ def main() -> None:
     (output_dir / "manifest.json").write_text(
         json.dumps(manifest, ensure_ascii=False, indent=2),
         encoding="utf-8",
+    )
+
+
+def generate_preset_prompt_audio(
+    service: Any,
+    model_path: str,
+    output_dir: Path,
+    language: str | None,
+    template_name: str,
+    ode_method: str,
+    num_steps: int,
+    guidance_scale: float,
+    speaker_scale: float,
+    normalize_text: bool,
+    seed: int,
+) -> tuple[str, str]:
+    from apps.gradio.service import SynthesisRequest  # noqa: PLC0415
+    from dots_tts.utils.util import seed_everything  # noqa: PLC0415
+
+    prompt_text = preset_prompt_text(language)
+    prompt_path = output_dir / "preset-prompt.wav"
+    seed_everything(seed)
+    runtime, _resolved_model = service._get_runtime(model_path)  # noqa: SLF001
+    request = SynthesisRequest(
+        model_name_or_path=model_path,
+        text=prompt_text,
+        prompt_audio_path=None,
+        prompt_text=None,
+        execution_mode="generate",
+        template_name=template_name,
+        language=language,
+        ode_method=ode_method,
+        num_steps=num_steps,
+        guidance_scale=guidance_scale,
+        speaker_scale=speaker_scale,
+        normalize_text=normalize_text,
+        seed=seed,
+    )
+    generation = runtime.generate(**service._build_runtime_generate_kwargs(request))  # noqa: SLF001
+    sf.write(
+        prompt_path,
+        generation["audio"].float().cpu().squeeze().numpy(),
+        int(generation["sample_rate"]),
+        subtype="PCM_16",
+    )
+    return str(prompt_path), prompt_text
+
+
+def preset_prompt_text(language: str | None) -> str:
+    normalized = (language or "").strip().lower()
+    if normalized.startswith("en"):
+        return (
+            "The morning light moves slowly across the room. "
+            "This is a calm audiobook narrator voice with clear pronunciation, steady pacing, and natural pauses."
+        )
+    return (
+        "Solen går långsamt upp över skogen. "
+        "Det här är en lugn berättarröst för ljudböcker, med tydligt uttal, jämnt tempo och naturliga pauser."
     )
 
 
