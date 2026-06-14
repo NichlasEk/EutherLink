@@ -39,6 +39,7 @@ DEFAULT_DATA_DIR = "/home/nichlas/EutherLink/data"
 DOTS_TTS_PYTHON = "/home/nichlas/ai/dots_tts/dots.tts/.venv/bin/python"
 DOTS_TTS_RENDERER = "/home/nichlas/EutherLink/scripts/render_dots_tts.py"
 DOTS_TTS_SOAR_PATH = "/home/nichlas/ai/dots_tts/models/dots.tts-soar"
+DOTS_TTS_MAX_WORDS = 180
 
 OutputFormat = Literal["wav", "mp3", "opus"]
 ModelBackend = Literal["voxcpm2", "dots.tts-soar"]
@@ -216,7 +217,11 @@ class EutherLinkTts:
             req = state.request
             self._set_state(job_id, status="loading", progress=0.01, message="Preparing TTS job")
 
-            chunks = split_text(req.text, req.max_chunk_chars)
+            chunks = (
+                split_dots_text(req.text, req.max_chunk_chars, DOTS_TTS_MAX_WORDS)
+                if req.model_backend == "dots.tts-soar"
+                else split_text(req.text, req.max_chunk_chars)
+            )
             if not chunks:
                 raise ValueError("No text to synthesize")
 
@@ -387,9 +392,10 @@ class EutherLinkTts:
         }
         request_path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
         LOGGER.warning(
-            "TTS_TRACE dots_start job=%s chunks=%s seed_effective=%s model=%s template=%s ode=%s steps=%s guidance=%.3f speaker=%.3f max_len=%s prompt_sha=%s",
+            "TTS_TRACE dots_start job=%s chunks=%s max_words=%s seed_effective=%s model=%s template=%s ode=%s steps=%s guidance=%.3f speaker=%.3f max_len=%s prompt_sha=%s",
             job_id,
             len(chunks),
+            max((word_count(chunk) for chunk in chunks), default=0),
             seed,
             model_path,
             req.dots_template_name,
@@ -535,6 +541,27 @@ def split_text(text: str, max_chars: int) -> list[str]:
     if current:
         chunks.append(current.strip())
     return chunks
+
+
+def split_dots_text(text: str, max_chars: int, max_words: int) -> list[str]:
+    chunks: list[str] = []
+    for chunk in split_text(text, max_chars):
+        if word_count(chunk) <= max_words:
+            chunks.append(chunk)
+            continue
+        chunks.extend(split_text_by_words(chunk, max_words))
+    return chunks
+
+
+def split_text_by_words(text: str, max_words: int) -> list[str]:
+    words = re.findall(r"\S+", text.strip())
+    if not words:
+        return []
+    return [" ".join(words[index : index + max_words]) for index in range(0, len(words), max_words)]
+
+
+def word_count(text: str) -> int:
+    return len(re.findall(r"\S+", text.strip()))
 
 
 def split_long_sentence(sentence: str, max_chars: int) -> list[str]:
