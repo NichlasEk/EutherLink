@@ -52,7 +52,7 @@ class DotsWorker:
             output_dir=self.output_dir,
             execution_mode="generate_stream",
             precision="bfloat16",
-            optimize=False,
+            optimize=True,
             max_generate_length=self.max_generate_length,
             repo_root=self.dots_root,
         )
