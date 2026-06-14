@@ -41,6 +41,7 @@ DOTS_TTS_RENDERER = "/home/nichlas/EutherLink/scripts/render_dots_tts.py"
 DOTS_TTS_SOAR_PATH = "/home/nichlas/ai/dots_tts/models/dots.tts-soar"
 DOTS_TTS_MAX_WORDS = 180
 DOTS_TTS_MIN_GENERATE_LENGTH = 500
+DOTS_TTS_SAMPLE_RATE = 48_000
 
 OutputFormat = Literal["wav", "mp3", "opus"]
 ModelBackend = Literal["voxcpm2", "dots.tts-soar"]
@@ -63,7 +64,7 @@ class TtsJobRequest(BaseModel):
     max_chunk_chars: int = Field(default=700, ge=120, le=1500)
     dots_template_name: DotsTemplateName = "tts"
     dots_ode_method: DotsOdeMethod = "euler"
-    dots_num_steps: int = Field(default=10, ge=1, le=50)
+    dots_num_steps: int = Field(default=8, ge=1, le=50)
     dots_guidance_scale: float = Field(default=1.2, ge=0.0, le=5.0)
     dots_speaker_scale: float = Field(default=1.5, ge=0.0, le=5.0)
     dots_max_generate_length: int = Field(default=500, ge=128, le=4096)
@@ -378,10 +379,11 @@ class EutherLinkTts:
         model_path = os.environ.get("EUTHERLINK_DOTS_TTS_SOAR_PATH", DOTS_TTS_SOAR_PATH)
         language = dots_language(req.language)
         max_generate_length = max(req.dots_max_generate_length, DOTS_TTS_MIN_GENERATE_LENGTH)
+        prompt_audio_path = prepare_dots_prompt_audio(voice_sample_path, job_dir)
         payload = {
             "model_path": model_path,
             "chunks": chunks,
-            "prompt_audio_path": str(voice_sample_path),
+            "prompt_audio_path": str(prompt_audio_path),
             "prompt_text": req.prompt_text,
             "language": language,
             "seed": seed,
@@ -408,7 +410,7 @@ class EutherLinkTts:
             req.dots_guidance_scale,
             req.dots_speaker_scale,
             max_generate_length,
-            file_short_sha256(voice_sample_path),
+            file_short_sha256(prompt_audio_path),
         )
         self._set_state(
             job_id,
@@ -483,6 +485,25 @@ def write_voice_sample(job_id: str, jobs_dir: Path, req: TtsJobRequest) -> Path 
     sample_path.parent.mkdir(parents=True, exist_ok=True)
     sample_path.write_bytes(sample)
     return sample_path
+
+
+def prepare_dots_prompt_audio(sample_path: Path, job_dir: Path) -> Path:
+    dots_sample_path = job_dir / "dots-prompt-48k.wav"
+    encode_args = [
+        "ffmpeg",
+        "-y",
+        "-i",
+        str(sample_path),
+        "-ac",
+        "1",
+        "-ar",
+        str(DOTS_TTS_SAMPLE_RATE),
+        "-sample_fmt",
+        "s16",
+        str(dots_sample_path),
+    ]
+    subprocess.run(encode_args, check=True, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
+    return dots_sample_path
 
 
 def short_sha256(data: bytes) -> str:
