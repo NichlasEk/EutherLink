@@ -47,6 +47,7 @@ DOTS_TTS_MAX_WORDS = 120
 DOTS_TTS_MIN_WORDS = 40
 DOTS_TTS_MODEL_MAX_WORDS = 180
 DOTS_TTS_DEFAULT_GENERATE_LENGTH = 500
+DOTS_TTS_DEFAULT_STEPS = 4
 DOTS_TTS_SAMPLE_RATE = 48_000
 PREWARM_DOTS_DEFAULT = "1"
 
@@ -71,7 +72,7 @@ class TtsJobRequest(BaseModel):
     max_chunk_chars: int = Field(default=700, ge=120, le=1500)
     dots_template_name: DotsTemplateName = "tts"
     dots_ode_method: DotsOdeMethod = "euler"
-    dots_num_steps: int = Field(default=8, ge=1, le=50)
+    dots_num_steps: int = Field(default=DOTS_TTS_DEFAULT_STEPS, ge=1, le=50)
     dots_guidance_scale: float = Field(default=1.2, ge=0.0, le=5.0)
     dots_speaker_scale: float = Field(default=1.5, ge=0.0, le=5.0)
     dots_max_generate_length: int = Field(default=DOTS_TTS_DEFAULT_GENERATE_LENGTH, ge=128, le=4096)
