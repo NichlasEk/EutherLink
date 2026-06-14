@@ -17,7 +17,7 @@ from pydantic import BaseModel
 DEFAULT_DOTS_ROOT = Path("/home/nichlas/ai/dots_tts/dots.tts")
 DEFAULT_OUTPUT_DIR = Path("/home/nichlas/EutherLink/data/dots-worker-artifacts")
 DEFAULT_MODEL_PATH = Path("/home/nichlas/ai/dots_tts/models/dots.tts-soar")
-DEFAULT_MAX_GENERATE_LENGTH = 256
+DEFAULT_MAX_GENERATE_LENGTH = 500
 
 
 class RenderRequest(BaseModel):
