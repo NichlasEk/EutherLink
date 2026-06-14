@@ -45,6 +45,7 @@ DOTS_TTS_SOAR_PATH = "/home/nichlas/ai/dots_tts/models/dots.tts-soar"
 DOTS_TTS_WORKER_URL = "http://127.0.0.1:18765"
 DOTS_TTS_MAX_WORDS = 180
 DOTS_TTS_MIN_WORDS = 45
+DOTS_TTS_MODEL_MAX_WORDS = 200
 DOTS_TTS_DEFAULT_GENERATE_LENGTH = 128
 DOTS_TTS_SAMPLE_RATE = 48_000
 PREWARM_DOTS_DEFAULT = "1"
@@ -741,7 +742,7 @@ def split_text_by_words(text: str, max_words: int, min_words: int = 0) -> list[s
     chunks = [words[index : index + max_words] for index in range(0, len(words), max_words)]
     if len(chunks) > 1 and min_words > 0 and len(chunks[-1]) < min_words:
         tail = chunks.pop()
-        if len(chunks[-1]) + len(tail) <= max_words + min_words:
+        if len(chunks[-1]) + len(tail) <= min(DOTS_TTS_MODEL_MAX_WORDS, max_words + min_words):
             chunks[-1].extend(tail)
         else:
             split_at = (len(chunks[-1]) + len(tail)) // 2
