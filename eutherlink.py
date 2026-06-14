@@ -244,7 +244,7 @@ class EutherLinkTts:
         ).encode("utf-8")
         with concurrent.futures.ThreadPoolExecutor(max_workers=1) as executor:
             future = executor.submit(self._post_dots_render, payload)
-            last_progress_signature: tuple[int, int, str] | None = None
+            last_progress_signature: tuple[int, int, str, int, int] | None = None
             while True:
                 try:
                     response_status = future.result(timeout=0.5)
@@ -271,10 +271,10 @@ class EutherLinkTts:
         self,
         job_id: str,
         progress_path: Path,
-        last_signature: tuple[int, int, str] | None = None,
+        last_signature: tuple[int, int, str, int, int] | None = None,
         *,
         force: bool = False,
-    ) -> tuple[int, int, str] | None:
+    ) -> tuple[int, int, str, int, int] | None:
         if not progress_path.exists():
             return None
         try:
@@ -284,23 +284,28 @@ class EutherLinkTts:
         index = int(data.get("chunk_index") or 0)
         total = max(1, int(data.get("chunk_total") or 1))
         status = str(data.get("status") or "")
-        signature = (index, total, status)
+        patch_count = max(0, int(data.get("patch_count") or 0))
+        patch_total = max(0, int(data.get("patch_total") or 0))
+        signature = (index, total, status, patch_count, patch_total)
         if not force and signature == last_signature:
             return signature
         chunk_progress = 0.0
         if status == "done":
             chunk_progress = 1.0
         elif status == "running":
-            chunk_progress = 0.5
+            chunk_progress = min(0.98, max(0.0, patch_count / patch_total)) if patch_total > 0 else 0.05
         elif status == "queued":
             chunk_progress = 0.05
         completed = max(0, index - 1) + chunk_progress
         progress = 0.05 + 0.9 * min(1.0, completed / total)
+        detail = ""
+        if status == "running" and patch_total > 0:
+            detail = f" {patch_count}/{patch_total} patches"
         self._set_state(
             job_id,
             status="running",
             progress=progress,
-            message=f"dots.tts-soar chunk {min(index, total)}/{total} {status}".strip(),
+            message=f"dots.tts-soar chunk {min(index, total)}/{total} {status}{detail}".strip(),
         )
         return signature
 

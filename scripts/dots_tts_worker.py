@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import re
 import sys
 import threading
 from pathlib import Path
@@ -79,6 +80,7 @@ class DotsWorker:
         with self.lock:
             for index, chunk in enumerate(chunks, start=1):
                 self._write_progress(progress_json, index, len(chunks), "running")
+                progress_state: dict[str, int] = {}
                 request = SynthesisRequest(
                     model_name_or_path=model_path,
                     text=chunk,
@@ -94,8 +96,15 @@ class DotsWorker:
                     normalize_text=bool(payload.get("normalize_text", False)),
                     seed=seed,
                 )
-                result = self.service.generate(request)
-                self._write_progress(progress_json, index, len(chunks), "done")
+                sink_id = self._add_progress_log_sink(progress_json, index, len(chunks), progress_state)
+                try:
+                    result = self.service.generate(request)
+                finally:
+                    if sink_id is not None:
+                        from loguru import logger as loguru_logger
+
+                        loguru_logger.remove(sink_id)
+                self._write_progress(progress_json, index, len(chunks), "done", progress_state.get("patch_total"), progress_state.get("patch_total"))
                 rendered_chunks.append(
                     {
                         "index": index,
@@ -118,21 +127,76 @@ class DotsWorker:
         )
         return {"ok": True, "manifest_path": str(manifest_path)}
 
+    def _add_progress_log_sink(
+        self,
+        progress_json: Path | None,
+        chunk_index: int,
+        chunk_total: int,
+        progress_state: dict[str, int],
+    ) -> int | None:
+        if progress_json is None:
+            return None
+
+        from loguru import logger as loguru_logger
+
+        def capture(message: object) -> None:
+            text = str(message)
+            prepared = re.search(r"prompt_audio_patch_count=(\d+) max_audio_patch_count=(\d+)", text)
+            if prepared:
+                prompt_patches = int(prepared.group(1))
+                max_patches = int(prepared.group(2))
+                progress_state["patch_total"] = max(1, max_patches - prompt_patches)
+                self._write_progress(
+                    progress_json,
+                    chunk_index,
+                    chunk_total,
+                    "running",
+                    0,
+                    progress_state["patch_total"],
+                )
+                return
+
+            progress = re.search(r"payload_audio_patches=(\d+)", text)
+            if progress:
+                patch_count = int(progress.group(1))
+                patch_total = progress_state.get("patch_total") or max(1, self.max_generate_length)
+                self._write_progress(
+                    progress_json,
+                    chunk_index,
+                    chunk_total,
+                    "running",
+                    patch_count,
+                    patch_total,
+                )
+
+        return loguru_logger.add(capture, level="INFO")
+
     @staticmethod
-    def _write_progress(progress_json: Path | None, chunk_index: int, chunk_total: int, status: str) -> None:
+    def _write_progress(
+        progress_json: Path | None,
+        chunk_index: int,
+        chunk_total: int,
+        status: str,
+        patch_count: int | None = None,
+        patch_total: int | None = None,
+    ) -> None:
         if progress_json is None:
             return
-        progress_json.write_text(
-            json.dumps(
-                {
-                    "chunk_index": chunk_index,
-                    "chunk_total": chunk_total,
-                    "status": status,
-                },
-                ensure_ascii=False,
-            ),
+        payload = {
+            "chunk_index": chunk_index,
+            "chunk_total": chunk_total,
+            "status": status,
+        }
+        if patch_count is not None:
+            payload["patch_count"] = patch_count
+        if patch_total is not None:
+            payload["patch_total"] = patch_total
+        temp_path = progress_json.with_name(f".{progress_json.name}.{threading.get_ident()}.tmp")
+        temp_path.write_text(
+            json.dumps(payload, ensure_ascii=False),
             encoding="utf-8",
         )
+        temp_path.replace(progress_json)
 
 
 def create_app(worker: DotsWorker) -> FastAPI:
