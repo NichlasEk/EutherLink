@@ -15,6 +15,8 @@ import re
 import subprocess
 import threading
 import time
+import urllib.error
+import urllib.request
 import uuid
 from pathlib import Path
 from typing import Any, Literal
@@ -38,7 +40,9 @@ DEFAULT_MODEL_PATH = (
 DEFAULT_DATA_DIR = "/home/nichlas/EutherLink/data"
 DOTS_TTS_PYTHON = "/home/nichlas/ai/dots_tts/dots.tts/.venv/bin/python"
 DOTS_TTS_RENDERER = "/home/nichlas/EutherLink/scripts/render_dots_tts.py"
+DOTS_TTS_WORKER = "/home/nichlas/EutherLink/scripts/dots_tts_worker.py"
 DOTS_TTS_SOAR_PATH = "/home/nichlas/ai/dots_tts/models/dots.tts-soar"
+DOTS_TTS_WORKER_URL = "http://127.0.0.1:18765"
 DOTS_TTS_MAX_WORDS = 180
 DOTS_TTS_MIN_GENERATE_LENGTH = 500
 DOTS_TTS_SAMPLE_RATE = 48_000
@@ -120,6 +124,8 @@ class EutherLinkTts:
         self.jobs_lock = threading.Lock()
         self.model_lock = threading.Lock()
         self.model: VoxCPM | None = None
+        self.dots_worker_lock = threading.Lock()
+        self.dots_worker_process: subprocess.Popen[bytes] | None = None
         self.executor = concurrent.futures.ThreadPoolExecutor(max_workers=1)
 
         self.jobs_dir = config.data_dir / "jobs"
@@ -137,6 +143,69 @@ class EutherLinkTts:
                         device="cuda",
                     )
         return self.model
+
+    def ensure_dots_worker(self) -> None:
+        with self.dots_worker_lock:
+            if self._dots_worker_healthy(timeout=0.5):
+                return
+            if self.dots_worker_process is not None and self.dots_worker_process.poll() is None:
+                self.dots_worker_process.terminate()
+                try:
+                    self.dots_worker_process.wait(timeout=5)
+                except subprocess.TimeoutExpired:
+                    self.dots_worker_process.kill()
+                    self.dots_worker_process.wait(timeout=5)
+
+            worker_env = os.environ.copy()
+            worker_env.setdefault("NUMBA_CACHE_DIR", str(self.config.data_dir / "numba-cache"))
+            self.dots_worker_process = subprocess.Popen(
+                [
+                    os.environ.get("EUTHERLINK_DOTS_TTS_PYTHON", DOTS_TTS_PYTHON),
+                    os.environ.get("EUTHERLINK_DOTS_TTS_WORKER", DOTS_TTS_WORKER),
+                    "--host",
+                    "127.0.0.1",
+                    "--port",
+                    "18765",
+                    "--output-dir",
+                    str(self.config.data_dir / "dots-worker-artifacts"),
+                ],
+                cwd=str(Path(DOTS_TTS_WORKER).resolve().parent),
+                env=worker_env,
+            )
+
+            deadline = time.time() + 90
+            while time.time() < deadline:
+                if self._dots_worker_healthy(timeout=2.0):
+                    return
+                if self.dots_worker_process.poll() is not None:
+                    raise RuntimeError(f"dots.tts worker exited with code {self.dots_worker_process.returncode}")
+                time.sleep(1)
+            raise TimeoutError("dots.tts worker did not become healthy")
+
+    def _dots_worker_healthy(self, timeout: float) -> bool:
+        try:
+            with urllib.request.urlopen(f"{DOTS_TTS_WORKER_URL}/health", timeout=timeout) as response:
+                return response.status == 200
+        except (OSError, urllib.error.URLError):
+            return False
+
+    def render_dots_with_worker(self, request_path: Path, dots_dir: Path) -> None:
+        self.ensure_dots_worker()
+        payload = json.dumps(
+            {
+                "request_json": str(request_path),
+                "output_dir": str(dots_dir),
+            }
+        ).encode("utf-8")
+        request = urllib.request.Request(
+            f"{DOTS_TTS_WORKER_URL}/render",
+            data=payload,
+            headers={"Content-Type": "application/json"},
+            method="POST",
+        )
+        with urllib.request.urlopen(request, timeout=None) as response:
+            if response.status != 200:
+                raise RuntimeError(f"dots.tts worker returned HTTP {response.status}")
 
     def submit(self, request: TtsJobRequest) -> JobState:
         job_id = uuid.uuid4().hex
@@ -418,19 +487,7 @@ class EutherLinkTts:
             progress=0.05,
             message=f"Synthesizing {len(chunks)} chunk(s) with dots.tts-soar",
         )
-        dots_env = os.environ.copy()
-        dots_env.setdefault("NUMBA_CACHE_DIR", str(self.config.data_dir / "numba-cache"))
-        subprocess.run(
-            [
-                os.environ.get("EUTHERLINK_DOTS_TTS_PYTHON", DOTS_TTS_PYTHON),
-                os.environ.get("EUTHERLINK_DOTS_TTS_RENDERER", DOTS_TTS_RENDERER),
-                str(request_path),
-                str(dots_dir),
-            ],
-            check=True,
-            cwd=str(Path(DOTS_TTS_RENDERER).resolve().parent),
-            env=dots_env,
-        )
+        self.render_dots_with_worker(request_path, dots_dir)
 
         manifest_path = dots_dir / "manifest.json"
         manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
