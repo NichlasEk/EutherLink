@@ -148,7 +148,7 @@ class DotsWorker:
         progress_state: dict[str, int],
     ) -> Any:
         from apps.gradio.service import SynthesisResult
-        from lightning import seed_everything
+        from dots_tts.utils.util import seed_everything
 
         normalized_request = self.service._normalize_request(request)  # noqa: SLF001
         seed_everything(normalized_request.seed)
