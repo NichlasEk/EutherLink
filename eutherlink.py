@@ -100,6 +100,7 @@ class TtsJobStatus(BaseModel):
     error: str | None = None
     audio_url: str | None = None
     partial_audio_urls: list[str] = Field(default_factory=list)
+    perf: dict[str, Any] = Field(default_factory=dict)
 
 
 @dataclasses.dataclass
@@ -119,6 +120,7 @@ class JobState:
     message: str = "Queued"
     error: str | None = None
     partial_audio_files: list[str] = dataclasses.field(default_factory=list)
+    perf: dict[str, Any] = dataclasses.field(default_factory=dict)
     created_at: float = dataclasses.field(default_factory=time.time)
     updated_at: float = dataclasses.field(default_factory=time.time)
 
@@ -239,6 +241,7 @@ class EutherLinkTts:
     def render_dots_with_worker(self, job_id: str, request_path: Path, dots_dir: Path) -> None:
         self.ensure_dots_worker()
         progress_path = dots_dir / "progress.json"
+        started = time.perf_counter()
         payload = json.dumps(
             {
                 "request_json": str(request_path),
@@ -255,6 +258,13 @@ class EutherLinkTts:
                     if response_status != 200:
                         raise RuntimeError(f"dots.tts worker returned HTTP {response_status}")
                     self._sync_dots_progress(job_id, progress_path, force=True)
+                    self._merge_perf(
+                        job_id,
+                        {
+                            "eutherlink_worker_render_wait_sec": time.perf_counter() - started,
+                            "eutherlink_worker_http_status": response_status,
+                        },
+                    )
                     return
                 except concurrent.futures.TimeoutError:
                     signature = self._sync_dots_progress(job_id, progress_path, last_progress_signature)
@@ -298,6 +308,20 @@ class EutherLinkTts:
         signature = (index, total, status, patch_count, patch_total, len(partials))
         if not force and signature == last_signature:
             return signature
+        perf_data = data.get("perf") if isinstance(data.get("perf"), dict) else {}
+        if perf_data:
+            self._merge_perf(
+                job_id,
+                {
+                    "dots_phase": perf_data.get("phase"),
+                    "dots_chunk_index": index,
+                    "dots_chunk_total": total,
+                    "dots_patch_count": patch_count,
+                    "dots_patch_total": patch_total,
+                    "dots_partial_count": len(partials),
+                    **{f"dots_{key}": value for key, value in perf_data.items() if key != "phase"},
+                },
+            )
         chunk_progress = 0.0
         if status == "done":
             chunk_progress = 1.0
@@ -318,6 +342,20 @@ class EutherLinkTts:
             partial_audio_files=partials,
         )
         return signature
+
+    def _merge_perf(self, job_id: str, updates: dict[str, Any]) -> None:
+        clean_updates = {
+            key: value
+            for key, value in updates.items()
+            if isinstance(key, str) and value is not None and isinstance(value, (str, int, float, bool))
+        }
+        if not clean_updates:
+            return
+        with self.jobs_lock:
+            state = self.jobs[job_id]
+            state.perf.update(clean_updates)
+            state.updated_at = time.time()
+            self._write_status(state)
 
     def submit(self, request: TtsJobRequest) -> JobState:
         job_id = uuid.uuid4().hex
@@ -361,6 +399,7 @@ class EutherLinkTts:
                 state.message = data["message"]
                 state.error = data.get("error")
                 state.partial_audio_files = list(data.get("partial_audio_files", []))
+                state.perf = dict(data.get("perf", {}))
                 state.created_at = data["created_at"]
                 state.updated_at = data["updated_at"]
             else:
@@ -399,6 +438,7 @@ class EutherLinkTts:
             "message": state.message,
             "error": state.error,
             "partial_audio_files": state.partial_audio_files,
+            "perf": state.perf,
             "created_at": state.created_at,
             "updated_at": state.updated_at,
         }
@@ -408,6 +448,7 @@ class EutherLinkTts:
         try:
             state = self.get(job_id)
             req = state.request
+            job_started = time.perf_counter()
             self._set_state(job_id, status="loading", progress=0.01, message="Preparing TTS job")
 
             chunks = (
@@ -417,8 +458,17 @@ class EutherLinkTts:
             )
             if not chunks:
                 raise ValueError("No text to synthesize")
+            self._merge_perf(
+                job_id,
+                {
+                    "eutherlink_chunk_count": len(chunks),
+                    "eutherlink_split_sec": time.perf_counter() - job_started,
+                },
+            )
 
+            sample_start = time.perf_counter()
             voice_sample_path = write_voice_sample(job_id, self.jobs_dir, req)
+            self._merge_perf(job_id, {"eutherlink_voice_sample_sec": time.perf_counter() - sample_start})
             if req.model_backend == "dots.tts-soar":
                 self._run_dots_tts_job(job_id, req, chunks, voice_sample_path)
                 return
@@ -525,13 +575,18 @@ class EutherLinkTts:
 
             job_dir = self.jobs_dir / job_id
             wav_path = job_dir / "audio.wav"
+            write_start = time.perf_counter()
             sf.write(wav_path, audio, sample_rate, subtype="PCM_16")
+            self._merge_perf(job_id, {"eutherlink_wav_write_sec": time.perf_counter() - write_start})
 
             output_path = job_dir / f"audio.{req.output_format}"
             if req.output_format == "wav":
                 output_path = wav_path
             else:
+                encode_start = time.perf_counter()
                 encode_audio(wav_path, output_path, req.output_format)
+                self._merge_perf(job_id, {"eutherlink_encode_sec": time.perf_counter() - encode_start})
+            self._merge_perf(job_id, {"eutherlink_total_sec": time.perf_counter() - job_started})
 
             self._set_state(
                 job_id,
@@ -557,6 +612,7 @@ class EutherLinkTts:
         chunks: list[str],
         voice_sample_path: Path | None,
     ) -> None:
+        dots_started = time.perf_counter()
         if voice_sample_path is None:
             raise ValueError("dots.tts-soar requires prompt_wav_base64 or reference_wav_base64")
         if not (req.prompt_text or "").strip():
@@ -613,6 +669,7 @@ class EutherLinkTts:
         self.render_dots_with_worker(job_id, request_path, dots_dir)
 
         manifest_path = dots_dir / "manifest.json"
+        combine_start = time.perf_counter()
         manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
         wav_parts: list[np.ndarray] = []
         sample_rate: int | None = None
@@ -634,12 +691,26 @@ class EutherLinkTts:
             raise ValueError("dots.tts did not render any audio")
         audio = normalize_peak(np.concatenate(wav_parts))
         wav_path = job_dir / "audio.wav"
+        write_start = time.perf_counter()
         sf.write(wav_path, audio, sample_rate, subtype="PCM_16")
+        wav_write_sec = time.perf_counter() - write_start
         output_path = job_dir / f"audio.{req.output_format}"
         if req.output_format == "wav":
             output_path = wav_path
         else:
+            encode_start = time.perf_counter()
             encode_audio(wav_path, output_path, req.output_format)
+            self._merge_perf(job_id, {"eutherlink_dots_encode_sec": time.perf_counter() - encode_start})
+        total_audio_sec = len(audio) / sample_rate if sample_rate else 0.0
+        self._merge_perf(
+            job_id,
+            {
+                "eutherlink_dots_combine_sec": time.perf_counter() - combine_start,
+                "eutherlink_dots_final_wav_write_sec": wav_write_sec,
+                "eutherlink_audio_sec": total_audio_sec,
+                "eutherlink_dots_total_sec": time.perf_counter() - dots_started,
+            },
+        )
         self._set_state(
             job_id,
             status="done",
@@ -916,6 +987,7 @@ def status_response(state: JobState) -> TtsJobStatus:
         error=state.error,
         audio_url=audio_url,
         partial_audio_urls=partial_audio_urls,
+        perf=state.perf,
     )
 
 

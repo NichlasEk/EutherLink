@@ -7,6 +7,7 @@ import os
 import re
 import sys
 import threading
+import time
 from pathlib import Path
 from typing import Any
 
@@ -85,8 +86,15 @@ class DotsWorker:
         rendered_chunks: list[dict[str, Any]] = []
         with self.lock:
             for index, chunk in enumerate(chunks, start=1):
-                self._write_progress(progress_json, index, len(chunks), "running")
-                progress_state: dict[str, int] = {}
+                chunk_started = time.perf_counter()
+                self._write_progress(
+                    progress_json,
+                    index,
+                    len(chunks),
+                    "running",
+                    perf={"phase": "chunk_start", "chunk_elapsed_sec": 0.0},
+                )
+                progress_state: dict[str, Any] = {"chunk_started": chunk_started}
                 request = SynthesisRequest(
                     model_name_or_path=model_path,
                     text=chunk,
@@ -117,7 +125,17 @@ class DotsWorker:
                         from loguru import logger as loguru_logger
 
                         loguru_logger.remove(sink_id)
-                self._write_progress(progress_json, index, len(chunks), "done", progress_state.get("patch_total"), progress_state.get("patch_total"))
+                chunk_elapsed = time.perf_counter() - chunk_started
+                self._write_progress(
+                    progress_json,
+                    index,
+                    len(chunks),
+                    "done",
+                    progress_state.get("patch_total"),
+                    progress_state.get("patch_total"),
+                    progress_state.get("partials"),
+                    perf={**result.metrics, "phase": "chunk_done", "chunk_elapsed_sec": chunk_elapsed},
+                )
                 rendered_chunks.append(
                     {
                         "index": index,
@@ -147,14 +165,17 @@ class DotsWorker:
         progress_json: Path | None,
         chunk_index: int,
         chunk_total: int,
-        progress_state: dict[str, int],
+        progress_state: dict[str, Any],
     ) -> Any:
         from apps.gradio.service import SynthesisResult
         from dots_tts.utils.util import seed_everything
 
+        started = time.perf_counter()
         normalized_request = self.service._normalize_request(request)  # noqa: SLF001
         seed_everything(normalized_request.seed)
+        runtime_start = time.perf_counter()
         runtime, resolved_model = self.service._get_runtime(normalized_request.model_name_or_path)  # noqa: SLF001
+        runtime_sec = time.perf_counter() - runtime_start
 
         partial_dir = output_dir / "partials"
         partial_dir.mkdir(parents=True, exist_ok=True)
@@ -164,19 +185,30 @@ class DotsWorker:
         sample_rate = runtime.sample_rate
         stream_part_samples = max(1, int(sample_rate * stream_part_seconds()))
         stream_samples = 0
+        generated_samples = 0
+        stream_events = 0
+        first_audio_sec: float | None = None
+        partial_write_sec = 0.0
 
         for stream_index, tensor in enumerate(
             runtime.generate_stream(**self.service._build_runtime_generate_kwargs(normalized_request)),  # noqa: SLF001
             start=1,
         ):
+            if first_audio_sec is None:
+                first_audio_sec = time.perf_counter() - started
             cpu_tensor = tensor.detach().float().cpu()
+            stream_events = stream_index
             stream_chunks.append(cpu_tensor)
             full_chunks.append(cpu_tensor)
-            stream_samples += int(cpu_tensor.shape[-1])
+            new_samples = int(cpu_tensor.shape[-1])
+            stream_samples += new_samples
+            generated_samples += new_samples
             if stream_samples >= stream_part_samples:
+                write_start = time.perf_counter()
                 partial_paths.append(
                     self._write_partial_audio(partial_dir, chunk_index, len(partial_paths) + 1, stream_chunks, sample_rate)
                 )
+                partial_write_sec += time.perf_counter() - write_start
                 progress_state["partials"] = partial_paths
                 stream_chunks = []
                 stream_samples = 0
@@ -188,12 +220,23 @@ class DotsWorker:
                     progress_state.get("patch_count"),
                     progress_state.get("patch_total"),
                     partial_paths,
+                    perf={
+                        "phase": "partial_ready",
+                        "chunk_elapsed_sec": time.perf_counter() - started,
+                        "first_audio_sec": first_audio_sec,
+                        "audio_ready_sec": generated_samples / sample_rate,
+                        "partial_count": len(partial_paths),
+                        "stream_events": stream_events,
+                        "partial_write_sec": partial_write_sec,
+                    },
                 )
 
         if stream_chunks:
+            write_start = time.perf_counter()
             partial_paths.append(
                 self._write_partial_audio(partial_dir, chunk_index, len(partial_paths) + 1, stream_chunks, sample_rate)
             )
+            partial_write_sec += time.perf_counter() - write_start
             progress_state["partials"] = partial_paths
             self._write_progress(
                 progress_json,
@@ -203,11 +246,21 @@ class DotsWorker:
                 progress_state.get("patch_count"),
                 progress_state.get("patch_total"),
                 partial_paths,
+                perf={
+                    "phase": "partial_ready",
+                    "chunk_elapsed_sec": time.perf_counter() - started,
+                    "first_audio_sec": first_audio_sec,
+                    "audio_ready_sec": generated_samples / sample_rate,
+                    "partial_count": len(partial_paths),
+                    "stream_events": stream_events,
+                    "partial_write_sec": partial_write_sec,
+                },
             )
         if not full_chunks:
             raise ValueError("dots.tts stream did not return audio")
 
         audio = torch.cat(full_chunks, dim=-1)
+        artifact_start = time.perf_counter()
         artifact_paths = self.service._write_generation_artifacts(  # noqa: SLF001
             request_id=self.service._build_stream_request_id(runtime, normalized_request),  # noqa: SLF001
             audio=audio,
@@ -215,11 +268,23 @@ class DotsWorker:
             request=normalized_request,
             resolved_model_name_or_path=str(resolved_model),
         )
+        artifact_sec = time.perf_counter() - artifact_start
+        total_sec = time.perf_counter() - started
+        audio_sec = generated_samples / sample_rate
         return SynthesisResult(
             audio_path=str(artifact_paths["output_path"]),
             metrics={
                 "sample_rate": sample_rate,
                 "stream_partial_count": len(partial_paths),
+                "stream_events": stream_events,
+                "audio_sec": audio_sec,
+                "total_sec": total_sec,
+                "rtf": total_sec / audio_sec if audio_sec > 0 else None,
+                "first_audio_sec": first_audio_sec,
+                "runtime_lookup_sec": runtime_sec,
+                "artifact_write_sec": artifact_sec,
+                "partial_write_sec": partial_write_sec,
+                "stream_part_seconds": stream_part_seconds(),
             },
             status="ok",
         )
@@ -238,7 +303,7 @@ class DotsWorker:
         progress_json: Path | None,
         chunk_index: int,
         chunk_total: int,
-        progress_state: dict[str, int],
+        progress_state: dict[str, Any],
     ) -> int | None:
         if progress_json is None:
             return None
@@ -259,6 +324,11 @@ class DotsWorker:
                     "running",
                     0,
                     progress_state["patch_total"],
+                    progress_state.get("partials"),
+                    perf={
+                        "phase": "patch_plan",
+                        "chunk_elapsed_sec": time.perf_counter() - float(progress_state.get("chunk_started", time.perf_counter())),
+                    },
                 )
                 return
 
@@ -275,6 +345,10 @@ class DotsWorker:
                     patch_count,
                     patch_total,
                     progress_state.get("partials"),
+                    perf={
+                        "phase": "patch_progress",
+                        "chunk_elapsed_sec": time.perf_counter() - float(progress_state.get("chunk_started", time.perf_counter())),
+                    },
                 )
 
         return loguru_logger.add(capture, level="INFO")
@@ -288,6 +362,7 @@ class DotsWorker:
         patch_count: int | None = None,
         patch_total: int | None = None,
         partials: list[str] | None = None,
+        perf: dict[str, Any] | None = None,
     ) -> None:
         if progress_json is None:
             return
@@ -302,6 +377,8 @@ class DotsWorker:
             payload["patch_total"] = patch_total
         if partials is not None:
             payload["partials"] = partials
+        if perf is not None:
+            payload["perf"] = perf
         temp_path = progress_json.with_name(f".{progress_json.name}.{threading.get_ident()}.tmp")
         temp_path.write_text(
             json.dumps(payload, ensure_ascii=False),
