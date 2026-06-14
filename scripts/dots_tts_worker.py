@@ -9,9 +9,11 @@ import threading
 from pathlib import Path
 from typing import Any
 
+import torch
 import uvicorn
 from fastapi import FastAPI
 from pydantic import BaseModel
+import soundfile as sf
 
 
 DEFAULT_DOTS_ROOT = Path("/home/nichlas/ai/dots_tts/dots.tts")
@@ -100,7 +102,14 @@ class DotsWorker:
                 )
                 sink_id = self._add_progress_log_sink(progress_json, index, len(chunks), progress_state)
                 try:
-                    result = self.service.generate(request)
+                    result = self._generate_streaming_partials(
+                        request,
+                        output_dir,
+                        progress_json,
+                        index,
+                        len(chunks),
+                        progress_state,
+                    )
                 finally:
                     if sink_id is not None:
                         from loguru import logger as loguru_logger
@@ -128,6 +137,96 @@ class DotsWorker:
             encoding="utf-8",
         )
         return {"ok": True, "manifest_path": str(manifest_path)}
+
+    def _generate_streaming_partials(
+        self,
+        request: Any,
+        output_dir: Path,
+        progress_json: Path | None,
+        chunk_index: int,
+        chunk_total: int,
+        progress_state: dict[str, int],
+    ) -> Any:
+        from apps.gradio.service import SynthesisResult
+        from lightning import seed_everything
+
+        normalized_request = self.service._normalize_request(request)  # noqa: SLF001
+        seed_everything(normalized_request.seed)
+        runtime, resolved_model = self.service._get_runtime(normalized_request.model_name_or_path)  # noqa: SLF001
+
+        partial_dir = output_dir / "partials"
+        partial_dir.mkdir(parents=True, exist_ok=True)
+        stream_chunks: list[torch.Tensor] = []
+        full_chunks: list[torch.Tensor] = []
+        partial_paths: list[str] = []
+        sample_rate = runtime.sample_rate
+        stream_group_size = 4
+
+        for stream_index, tensor in enumerate(
+            runtime.generate_stream(**self.service._build_runtime_generate_kwargs(normalized_request)),  # noqa: SLF001
+            start=1,
+        ):
+            cpu_tensor = tensor.detach().float().cpu()
+            stream_chunks.append(cpu_tensor)
+            full_chunks.append(cpu_tensor)
+            if len(stream_chunks) >= stream_group_size:
+                partial_paths.append(
+                    self._write_partial_audio(partial_dir, chunk_index, len(partial_paths) + 1, stream_chunks, sample_rate)
+                )
+                progress_state["partials"] = partial_paths
+                stream_chunks = []
+                self._write_progress(
+                    progress_json,
+                    chunk_index,
+                    chunk_total,
+                    "running",
+                    progress_state.get("patch_count"),
+                    progress_state.get("patch_total"),
+                    partial_paths,
+                )
+
+        if stream_chunks:
+            partial_paths.append(
+                self._write_partial_audio(partial_dir, chunk_index, len(partial_paths) + 1, stream_chunks, sample_rate)
+            )
+            progress_state["partials"] = partial_paths
+            self._write_progress(
+                progress_json,
+                chunk_index,
+                chunk_total,
+                "running",
+                progress_state.get("patch_count"),
+                progress_state.get("patch_total"),
+                partial_paths,
+            )
+        if not full_chunks:
+            raise ValueError("dots.tts stream did not return audio")
+
+        audio = torch.cat(full_chunks, dim=-1)
+        artifact_paths = self.service._write_generation_artifacts(  # noqa: SLF001
+            request_id=self.service._build_stream_request_id(runtime, normalized_request),  # noqa: SLF001
+            audio=audio,
+            sample_rate=sample_rate,
+            request=normalized_request,
+            resolved_model_name_or_path=str(resolved_model),
+        )
+        return SynthesisResult(
+            audio_path=str(artifact_paths["output_path"]),
+            metrics={
+                "sample_rate": sample_rate,
+                "stream_partial_count": len(partial_paths),
+            },
+            status="ok",
+        )
+
+    @staticmethod
+    def _write_partial_audio(partial_dir: Path, chunk_index: int, partial_index: int, chunks: list[torch.Tensor], sample_rate: int) -> str:
+        audio = torch.cat(chunks, dim=-1).squeeze().numpy()
+        path = partial_dir / f"chunk-{chunk_index:03d}-part-{partial_index:03d}.wav"
+        temp_path = path.with_name(f".{path.name}.tmp")
+        sf.write(temp_path, audio, sample_rate, subtype="PCM_16")
+        temp_path.replace(path)
+        return path.name
 
     def _add_progress_log_sink(
         self,
@@ -161,6 +260,7 @@ class DotsWorker:
             progress = re.search(r"payload_audio_patches=(\d+)", text)
             if progress:
                 patch_count = int(progress.group(1))
+                progress_state["patch_count"] = patch_count
                 patch_total = progress_state.get("patch_total") or max(1, self.max_generate_length)
                 self._write_progress(
                     progress_json,
@@ -169,6 +269,7 @@ class DotsWorker:
                     "running",
                     patch_count,
                     patch_total,
+                    progress_state.get("partials"),
                 )
 
         return loguru_logger.add(capture, level="INFO")
@@ -181,6 +282,7 @@ class DotsWorker:
         status: str,
         patch_count: int | None = None,
         patch_total: int | None = None,
+        partials: list[str] | None = None,
     ) -> None:
         if progress_json is None:
             return
@@ -193,6 +295,8 @@ class DotsWorker:
             payload["patch_count"] = patch_count
         if patch_total is not None:
             payload["patch_total"] = patch_total
+        if partials is not None:
+            payload["partials"] = partials
         temp_path = progress_json.with_name(f".{progress_json.name}.{threading.get_ident()}.tmp")
         temp_path.write_text(
             json.dumps(payload, ensure_ascii=False),

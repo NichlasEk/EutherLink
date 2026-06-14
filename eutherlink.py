@@ -98,6 +98,7 @@ class TtsJobStatus(BaseModel):
     updated_at: float
     error: str | None = None
     audio_url: str | None = None
+    partial_audio_urls: list[str] = Field(default_factory=list)
 
 
 @dataclasses.dataclass
@@ -116,6 +117,7 @@ class JobState:
     progress: float = 0.0
     message: str = "Queued"
     error: str | None = None
+    partial_audio_files: list[str] = dataclasses.field(default_factory=list)
     created_at: float = dataclasses.field(default_factory=time.time)
     updated_at: float = dataclasses.field(default_factory=time.time)
 
@@ -245,7 +247,7 @@ class EutherLinkTts:
         ).encode("utf-8")
         with concurrent.futures.ThreadPoolExecutor(max_workers=1) as executor:
             future = executor.submit(self._post_dots_render, payload)
-            last_progress_signature: tuple[int, int, str, int, int] | None = None
+            last_progress_signature: tuple[int, int, str, int, int, int] | None = None
             while True:
                 try:
                     response_status = future.result(timeout=0.5)
@@ -272,10 +274,10 @@ class EutherLinkTts:
         self,
         job_id: str,
         progress_path: Path,
-        last_signature: tuple[int, int, str, int, int] | None = None,
+        last_signature: tuple[int, int, str, int, int, int] | None = None,
         *,
         force: bool = False,
-    ) -> tuple[int, int, str, int, int] | None:
+    ) -> tuple[int, int, str, int, int, int] | None:
         if not progress_path.exists():
             return None
         try:
@@ -287,7 +289,12 @@ class EutherLinkTts:
         status = str(data.get("status") or "")
         patch_count = max(0, int(data.get("patch_count") or 0))
         patch_total = max(0, int(data.get("patch_total") or 0))
-        signature = (index, total, status, patch_count, patch_total)
+        partials = [
+            name
+            for name in (data.get("partials") or [])
+            if isinstance(name, str) and "/" not in name and "\\" not in name and name.endswith(".wav")
+        ]
+        signature = (index, total, status, patch_count, patch_total, len(partials))
         if not force and signature == last_signature:
             return signature
         chunk_progress = 0.0
@@ -307,6 +314,7 @@ class EutherLinkTts:
             status="running",
             progress=progress,
             message=f"dots.tts-soar chunk {min(index, total)}/{total} {status}{detail}".strip(),
+            partial_audio_files=partials,
         )
         return signature
 
@@ -351,6 +359,7 @@ class EutherLinkTts:
                 state.progress = data["progress"]
                 state.message = data["message"]
                 state.error = data.get("error")
+                state.partial_audio_files = list(data.get("partial_audio_files", []))
                 state.created_at = data["created_at"]
                 state.updated_at = data["updated_at"]
             else:
@@ -360,6 +369,14 @@ class EutherLinkTts:
     def audio_path(self, job_id: str) -> Path:
         state = self.get(job_id)
         return self.jobs_dir / job_id / f"audio.{state.request.output_format}"
+
+    def partial_audio_path(self, job_id: str, filename: str) -> Path:
+        if "/" in filename or "\\" in filename or not filename.endswith(".wav"):
+            raise ValueError("invalid partial filename")
+        path = self.jobs_dir / job_id / "dots.tts-soar" / "partials" / filename
+        if not path.exists():
+            raise FileNotFoundError(filename)
+        return path
 
     def _set_state(self, job_id: str, **updates: object) -> JobState:
         with self.jobs_lock:
@@ -380,6 +397,7 @@ class EutherLinkTts:
             "progress": state.progress,
             "message": state.message,
             "error": state.error,
+            "partial_audio_files": state.partial_audio_files,
             "created_at": state.created_at,
             "updated_at": state.updated_at,
         }
@@ -863,11 +881,29 @@ def build_app(service: EutherLinkTts) -> FastAPI:
             raise HTTPException(status_code=404, detail="audio file not found")
         return FileResponse(path, filename=path.name)
 
+    @app.get("/v1/tts/jobs/{job_id}/partials/{filename}")
+    def get_tts_partial_audio(job_id: str, filename: str) -> FileResponse:
+        try:
+            service.get(job_id)
+            path = service.partial_audio_path(job_id, filename)
+        except KeyError:
+            raise HTTPException(status_code=404, detail="job not found") from None
+        except ValueError:
+            raise HTTPException(status_code=400, detail="invalid partial filename") from None
+        except FileNotFoundError:
+            raise HTTPException(status_code=404, detail="partial audio file not found") from None
+        return FileResponse(path, filename=path.name)
+
     return app
 
 
 def status_response(state: JobState) -> TtsJobStatus:
     audio_url = f"/v1/tts/jobs/{state.id}/audio" if state.status == "done" else None
+    partial_audio_urls = [
+        f"/v1/tts/jobs/{state.id}/partials/{filename}"
+        for filename in state.partial_audio_files
+        if "/" not in filename and "\\" not in filename
+    ]
     return TtsJobStatus(
         id=state.id,
         status=state.status,
@@ -878,6 +914,7 @@ def status_response(state: JobState) -> TtsJobStatus:
         updated_at=state.updated_at,
         error=state.error,
         audio_url=audio_url,
+        partial_audio_urls=partial_audio_urls,
     )
 
 
