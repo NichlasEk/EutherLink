@@ -17,7 +17,7 @@ from pydantic import BaseModel
 DEFAULT_DOTS_ROOT = Path("/home/nichlas/ai/dots_tts/dots.tts")
 DEFAULT_OUTPUT_DIR = Path("/home/nichlas/EutherLink/data/dots-worker-artifacts")
 DEFAULT_MODEL_PATH = Path("/home/nichlas/ai/dots_tts/models/dots.tts-soar")
-DEFAULT_MAX_GENERATE_LENGTH = 128
+DEFAULT_MAX_GENERATE_LENGTH = 500
 
 
 class RenderRequest(BaseModel):
@@ -45,7 +45,7 @@ class DotsWorker:
         config = build_gradio_app_config(
             model_name_or_path=str(DEFAULT_MODEL_PATH),
             output_dir=self.output_dir,
-            execution_mode="generate",
+            execution_mode="generate_stream",
             precision="bfloat16",
             optimize=False,
             max_generate_length=self.max_generate_length,
@@ -55,11 +55,13 @@ class DotsWorker:
 
     def preload(self) -> dict[str, Any]:
         with self.lock:
-            _, resolved_model_path = self.service._get_runtime(str(DEFAULT_MODEL_PATH))
+            metrics = self.service.warmup()
+            resolved_model_path = str(metrics.get("resolved_model_name_or_path") or DEFAULT_MODEL_PATH)
         return {
             "ok": True,
             "model_loaded": True,
             "loaded_model": resolved_model_path,
+            "warmup": metrics,
         }
 
     def render(self, request_json: Path, output_dir: Path, progress_json: Path | None = None) -> dict[str, Any]:
@@ -86,7 +88,7 @@ class DotsWorker:
                     text=chunk,
                     prompt_audio_path=prompt_audio_path,
                     prompt_text=prompt_text,
-                    execution_mode="generate",
+                    execution_mode=str(payload.get("execution_mode", "generate_stream")),
                     template_name=str(payload.get("template_name", "tts")),
                     language=payload.get("language") or None,
                     ode_method=str(payload.get("ode_method", "euler")),

@@ -46,7 +46,7 @@ DOTS_TTS_WORKER_URL = "http://127.0.0.1:18765"
 DOTS_TTS_MAX_WORDS = 180
 DOTS_TTS_MIN_WORDS = 45
 DOTS_TTS_MODEL_MAX_WORDS = 200
-DOTS_TTS_DEFAULT_GENERATE_LENGTH = 128
+DOTS_TTS_DEFAULT_GENERATE_LENGTH = 500
 DOTS_TTS_SAMPLE_RATE = 48_000
 PREWARM_DOTS_DEFAULT = "1"
 
@@ -161,6 +161,7 @@ class EutherLinkTts:
 
             worker_env = os.environ.copy()
             worker_env.setdefault("NUMBA_CACHE_DIR", str(self.config.data_dir / "numba-cache"))
+            dots_generate_length = max(DOTS_TTS_DEFAULT_GENERATE_LENGTH, int(os.environ.get("EUTHERLINK_DOTS_TTS_MAX_GENERATE_LENGTH", DOTS_TTS_DEFAULT_GENERATE_LENGTH)))
             self.dots_worker_process = subprocess.Popen(
                 [
                     os.environ.get("EUTHERLINK_DOTS_TTS_PYTHON", DOTS_TTS_PYTHON),
@@ -172,7 +173,7 @@ class EutherLinkTts:
                     "--output-dir",
                     str(self.config.data_dir / "dots-worker-artifacts"),
                     "--max-generate-length",
-                    str(DOTS_TTS_DEFAULT_GENERATE_LENGTH),
+                    str(dots_generate_length),
                 ],
                 cwd=str(Path(DOTS_TTS_WORKER).resolve().parent),
                 env=worker_env,
@@ -549,7 +550,7 @@ class EutherLinkTts:
         seed = stable_voice_seed(voice_sample_path, req)
         model_path = os.environ.get("EUTHERLINK_DOTS_TTS_SOAR_PATH", DOTS_TTS_SOAR_PATH)
         language = dots_language(req.language)
-        max_generate_length = req.dots_max_generate_length
+        max_generate_length = max(DOTS_TTS_DEFAULT_GENERATE_LENGTH, req.dots_max_generate_length)
         prompt_audio_path = prepare_dots_prompt_audio(voice_sample_path, job_dir)
         payload = {
             "model_path": model_path,
@@ -564,6 +565,7 @@ class EutherLinkTts:
             "guidance_scale": req.dots_guidance_scale,
             "speaker_scale": req.dots_speaker_scale,
             "max_generate_length": max_generate_length,
+            "execution_mode": "generate_stream",
             "normalize_text": req.normalize,
         }
         request_path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
