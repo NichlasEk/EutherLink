@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import sys
 from pathlib import Path
@@ -130,7 +131,23 @@ def generate_preset_prompt_audio(
     from dots_tts.utils.util import seed_everything  # noqa: PLC0415
 
     prompt_text = preset_prompt_text(language)
-    prompt_path = output_dir / "preset-prompt.wav"
+    prompt_path = preset_prompt_cache_path(
+        output_dir=output_dir,
+        model_path=model_path,
+        language=language,
+        template_name=template_name,
+        ode_method=ode_method,
+        num_steps=num_steps,
+        guidance_scale=guidance_scale,
+        speaker_scale=speaker_scale,
+        normalize_text=normalize_text,
+        seed=seed,
+        prompt_text=prompt_text,
+    )
+    if prompt_path.exists() and prompt_path.stat().st_size > 0:
+        return str(prompt_path), prompt_text
+    prompt_path.parent.mkdir(parents=True, exist_ok=True)
+    temp_prompt_path = output_dir / f".preset-prompt-{prompt_path.stem}.tmp.wav"
     seed_everything(seed)
     runtime, _resolved_model = service._get_runtime(model_path)  # noqa: SLF001
     request = SynthesisRequest(
@@ -150,12 +167,46 @@ def generate_preset_prompt_audio(
     )
     generation = runtime.generate(**service._build_runtime_generate_kwargs(request))  # noqa: SLF001
     sf.write(
-        prompt_path,
+        temp_prompt_path,
         generation["audio"].float().cpu().squeeze().numpy(),
         int(generation["sample_rate"]),
         subtype="PCM_16",
     )
+    temp_prompt_path.replace(prompt_path)
     return str(prompt_path), prompt_text
+
+
+def preset_prompt_cache_path(
+    output_dir: Path,
+    model_path: str,
+    language: str | None,
+    template_name: str,
+    ode_method: str,
+    num_steps: int,
+    guidance_scale: float,
+    speaker_scale: float,
+    normalize_text: bool,
+    seed: int,
+    prompt_text: str,
+) -> Path:
+    material = json.dumps(
+        {
+            "model_path": model_path,
+            "language": language,
+            "template_name": template_name,
+            "ode_method": ode_method,
+            "num_steps": num_steps,
+            "guidance_scale": guidance_scale,
+            "speaker_scale": speaker_scale,
+            "normalize_text": normalize_text,
+            "seed": seed,
+            "prompt_text": prompt_text,
+        },
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode("utf-8")
+    digest = hashlib.sha256(material).hexdigest()[:24]
+    return output_dir / "preset-prompts" / f"{digest}.wav"
 
 
 def preset_prompt_text(language: str | None) -> str:
