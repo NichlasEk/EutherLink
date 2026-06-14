@@ -42,6 +42,7 @@ DOTS_TTS_PYTHON = "/home/nichlas/ai/dots_tts/dots.tts/.venv/bin/python"
 DOTS_TTS_RENDERER = "/home/nichlas/EutherLink/scripts/render_dots_tts.py"
 DOTS_TTS_WORKER = "/home/nichlas/EutherLink/scripts/dots_tts_worker.py"
 DOTS_TTS_SOAR_PATH = "/home/nichlas/ai/dots_tts/models/dots.tts-soar"
+DOTS_TTS_MF_PATH = "/home/nichlas/ai/dots_tts/models/dots.tts-mf"
 DOTS_TTS_WORKER_URL = "http://127.0.0.1:18765"
 DOTS_TTS_MAX_WORDS = 120
 DOTS_TTS_MIN_WORDS = 40
@@ -52,7 +53,7 @@ DOTS_TTS_SAMPLE_RATE = 48_000
 PREWARM_DOTS_DEFAULT = "1"
 
 OutputFormat = Literal["wav", "mp3", "opus"]
-ModelBackend = Literal["voxcpm2", "dots.tts-soar"]
+ModelBackend = Literal["voxcpm2", "dots.tts-soar", "dots.tts-mf"]
 DotsTemplateName = Literal["tts", "instruction_tts", "text_to_audio", "tts_interleave"]
 DotsOdeMethod = Literal["euler", "midpoint"]
 
@@ -338,7 +339,7 @@ class EutherLinkTts:
             job_id,
             status="running",
             progress=progress,
-            message=f"dots.tts-soar chunk {min(index, total)}/{total} {status}{detail}".strip(),
+            message=f"dots.tts chunk {min(index, total)}/{total} {status}{detail}".strip(),
             partial_audio_files=partials,
         )
         return signature
@@ -413,7 +414,9 @@ class EutherLinkTts:
     def partial_audio_path(self, job_id: str, filename: str) -> Path:
         if "/" in filename or "\\" in filename or not filename.endswith(".wav"):
             raise ValueError("invalid partial filename")
-        path = self.jobs_dir / job_id / "dots.tts-soar" / "partials" / filename
+        state = self.get(job_id)
+        dots_dir = state.request.model_backend if is_dots_backend(state.request.model_backend) else "dots.tts-soar"
+        path = self.jobs_dir / job_id / dots_dir / "partials" / filename
         if not path.exists():
             raise FileNotFoundError(filename)
         return path
@@ -453,7 +456,7 @@ class EutherLinkTts:
 
             chunks = (
                 split_dots_text(req.text, req.max_chunk_chars, DOTS_TTS_MAX_WORDS)
-                if req.model_backend == "dots.tts-soar"
+                if is_dots_backend(req.model_backend)
                 else split_text(req.text, req.max_chunk_chars)
             )
             if not chunks:
@@ -469,7 +472,7 @@ class EutherLinkTts:
             sample_start = time.perf_counter()
             voice_sample_path = write_voice_sample(job_id, self.jobs_dir, req)
             self._merge_perf(job_id, {"eutherlink_voice_sample_sec": time.perf_counter() - sample_start})
-            if req.model_backend == "dots.tts-soar":
+            if is_dots_backend(req.model_backend):
                 self._run_dots_tts_job(job_id, req, chunks, voice_sample_path)
                 return
 
@@ -614,16 +617,16 @@ class EutherLinkTts:
     ) -> None:
         dots_started = time.perf_counter()
         if voice_sample_path is None:
-            raise ValueError("dots.tts-soar requires prompt_wav_base64 or reference_wav_base64")
+            raise ValueError(f"{req.model_backend} requires prompt_wav_base64 or reference_wav_base64")
         if not (req.prompt_text or "").strip():
-            raise ValueError("dots.tts-soar requires prompt_text matching the prompt audio")
+            raise ValueError(f"{req.model_backend} requires prompt_text matching the prompt audio")
 
         job_dir = self.jobs_dir / job_id
-        dots_dir = job_dir / "dots.tts-soar"
+        dots_dir = job_dir / req.model_backend
         request_path = dots_dir / "request.json"
         dots_dir.mkdir(parents=True, exist_ok=True)
         seed = stable_voice_seed(voice_sample_path, req)
-        model_path = os.environ.get("EUTHERLINK_DOTS_TTS_SOAR_PATH", DOTS_TTS_SOAR_PATH)
+        model_path = dots_model_path(req.model_backend)
         language = dots_language(req.language)
         max_generate_length = req.dots_max_generate_length
         prompt_audio_path = prepare_dots_prompt_audio(voice_sample_path, job_dir)
@@ -645,8 +648,9 @@ class EutherLinkTts:
         }
         request_path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
         LOGGER.warning(
-            "TTS_TRACE dots_start job=%s chunks=%s max_words=%s seed_effective=%s model=%s language=%s template=%s ode=%s steps=%s guidance=%.3f speaker=%.3f max_len=%s prompt_sha=%s",
+            "TTS_TRACE dots_start job=%s backend=%s chunks=%s max_words=%s seed_effective=%s model=%s language=%s template=%s ode=%s steps=%s guidance=%.3f speaker=%.3f max_len=%s prompt_sha=%s",
             job_id,
+            req.model_backend,
             len(chunks),
             max((word_count(chunk) for chunk in chunks), default=0),
             seed,
@@ -664,7 +668,7 @@ class EutherLinkTts:
             job_id,
             status="running",
             progress=0.05,
-            message=f"Synthesizing {len(chunks)} chunk(s) with dots.tts-soar",
+            message=f"Synthesizing {len(chunks)} chunk(s) with {req.model_backend}",
         )
         self.render_dots_with_worker(job_id, request_path, dots_dir)
 
@@ -860,6 +864,16 @@ def dots_language(language: str) -> str | None:
     if normalized.startswith("口音:"):
         return normalized
     return normalized.upper()
+
+
+def is_dots_backend(model_backend: str) -> bool:
+    return model_backend in {"dots.tts-soar", "dots.tts-mf"}
+
+
+def dots_model_path(model_backend: str) -> str:
+    if model_backend == "dots.tts-mf":
+        return os.environ.get("EUTHERLINK_DOTS_TTS_MF_PATH", DOTS_TTS_MF_PATH)
+    return os.environ.get("EUTHERLINK_DOTS_TTS_SOAR_PATH", DOTS_TTS_SOAR_PATH)
 
 
 def split_long_sentence(sentence: str, max_chars: int) -> list[str]:

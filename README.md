@@ -4,7 +4,7 @@ EutherLink is a small LAN service for running heavy local AI jobs on the RTX 409
 machine and letting smaller Euther services call it over HTTP.
 
 The first worker is VoxCPM2 text-to-speech for audiobook-style rendering.
-`dots.tts-soar` is also available as an optional backend through the separate
+`dots.tts-soar` and `dots.tts-mf` are also available as optional backends through the separate
 library under `/home/nichlas/ai/dots_tts`.
 
 ## Start
@@ -44,7 +44,7 @@ Poll the returned `status_url`, then download `audio_url` when status is `done`.
 curl -L http://127.0.0.1:8765/v1/tts/jobs/JOB_ID/audio -o test.opus
 ```
 
-## Optional dots.tts-soar Backend
+## Optional dots.tts Backends
 
 The Dots backend is isolated from VoxCPM2:
 
@@ -52,9 +52,11 @@ The Dots backend is isolated from VoxCPM2:
 /home/nichlas/ai/dots_tts/dots.tts              # Space/source checkout
 /home/nichlas/ai/dots_tts/dots.tts/.venv        # Python 3.12 runtime
 /home/nichlas/ai/dots_tts/models/dots.tts-soar  # downloaded model weights
+/home/nichlas/ai/dots_tts/models/dots.tts-mf    # faster MeanFlow weights
 /home/nichlas/ai/dots_tts/render_eutherlink.py  # subprocess renderer
 ```
 
-Use it by setting `"model_backend": "dots.tts-soar"`. Dots requires a reference
+Use SOAR by setting `"model_backend": "dots.tts-soar"` or the faster MeanFlow
+student by setting `"model_backend": "dots.tts-mf"`. Dots requires a reference
 WAV and matching `prompt_text`, so send either `prompt_wav_base64` or
 `reference_wav_base64`.
