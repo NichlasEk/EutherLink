@@ -40,6 +40,7 @@ DOTS_TTS_PYTHON = "/home/nichlas/ai/dots_tts/dots.tts/.venv/bin/python"
 DOTS_TTS_RENDERER = "/home/nichlas/EutherLink/scripts/render_dots_tts.py"
 DOTS_TTS_SOAR_PATH = "/home/nichlas/ai/dots_tts/models/dots.tts-soar"
 DOTS_TTS_MAX_WORDS = 180
+DOTS_TTS_MIN_GENERATE_LENGTH = 500
 
 OutputFormat = Literal["wav", "mp3", "opus"]
 ModelBackend = Literal["voxcpm2", "dots.tts-soar"]
@@ -375,35 +376,38 @@ class EutherLinkTts:
         dots_dir.mkdir(parents=True, exist_ok=True)
         seed = stable_voice_seed(voice_sample_path, req)
         model_path = os.environ.get("EUTHERLINK_DOTS_TTS_SOAR_PATH", DOTS_TTS_SOAR_PATH)
+        language = dots_language(req.language)
+        max_generate_length = max(req.dots_max_generate_length, DOTS_TTS_MIN_GENERATE_LENGTH)
         payload = {
             "model_path": model_path,
             "chunks": chunks,
             "prompt_audio_path": str(voice_sample_path),
             "prompt_text": req.prompt_text,
-            "language": req.language,
+            "language": language,
             "seed": seed,
             "template_name": req.dots_template_name,
             "ode_method": req.dots_ode_method,
             "num_steps": req.dots_num_steps,
             "guidance_scale": req.dots_guidance_scale,
             "speaker_scale": req.dots_speaker_scale,
-            "max_generate_length": req.dots_max_generate_length,
+            "max_generate_length": max_generate_length,
             "normalize_text": req.normalize,
         }
         request_path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
         LOGGER.warning(
-            "TTS_TRACE dots_start job=%s chunks=%s max_words=%s seed_effective=%s model=%s template=%s ode=%s steps=%s guidance=%.3f speaker=%.3f max_len=%s prompt_sha=%s",
+            "TTS_TRACE dots_start job=%s chunks=%s max_words=%s seed_effective=%s model=%s language=%s template=%s ode=%s steps=%s guidance=%.3f speaker=%.3f max_len=%s prompt_sha=%s",
             job_id,
             len(chunks),
             max((word_count(chunk) for chunk in chunks), default=0),
             seed,
             model_path,
+            language,
             req.dots_template_name,
             req.dots_ode_method,
             req.dots_num_steps,
             req.dots_guidance_scale,
             req.dots_speaker_scale,
-            req.dots_max_generate_length,
+            max_generate_length,
             file_short_sha256(voice_sample_path),
         )
         self._set_state(
@@ -562,6 +566,15 @@ def split_text_by_words(text: str, max_words: int) -> list[str]:
 
 def word_count(text: str) -> int:
     return len(re.findall(r"\S+", text.strip()))
+
+
+def dots_language(language: str) -> str | None:
+    normalized = language.strip()
+    if not normalized:
+        return None
+    if normalized.startswith("口音:"):
+        return normalized
+    return normalized.upper()
 
 
 def split_long_sentence(sentence: str, max_chars: int) -> list[str]:
