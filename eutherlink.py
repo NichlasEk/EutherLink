@@ -44,7 +44,7 @@ DOTS_TTS_WORKER = "/home/nichlas/EutherLink/scripts/dots_tts_worker.py"
 DOTS_TTS_SOAR_PATH = "/home/nichlas/ai/dots_tts/models/dots.tts-soar"
 DOTS_TTS_WORKER_URL = "http://127.0.0.1:18765"
 DOTS_TTS_MAX_WORDS = 180
-DOTS_TTS_MIN_GENERATE_LENGTH = 500
+DOTS_TTS_DEFAULT_GENERATE_LENGTH = 128
 DOTS_TTS_SAMPLE_RATE = 48_000
 PREWARM_DOTS_DEFAULT = "1"
 
@@ -72,7 +72,7 @@ class TtsJobRequest(BaseModel):
     dots_num_steps: int = Field(default=8, ge=1, le=50)
     dots_guidance_scale: float = Field(default=1.2, ge=0.0, le=5.0)
     dots_speaker_scale: float = Field(default=1.5, ge=0.0, le=5.0)
-    dots_max_generate_length: int = Field(default=500, ge=128, le=4096)
+    dots_max_generate_length: int = Field(default=DOTS_TTS_DEFAULT_GENERATE_LENGTH, ge=128, le=4096)
     prompt_wav_base64: str | None = Field(default=None, max_length=32_000_000)
     reference_wav_base64: str | None = Field(default=None, max_length=32_000_000)
     prompt_text: str | None = Field(default=None, max_length=500)
@@ -169,6 +169,8 @@ class EutherLinkTts:
                     "18765",
                     "--output-dir",
                     str(self.config.data_dir / "dots-worker-artifacts"),
+                    "--max-generate-length",
+                    str(DOTS_TTS_DEFAULT_GENERATE_LENGTH),
                 ],
                 cwd=str(Path(DOTS_TTS_WORKER).resolve().parent),
                 env=worker_env,
@@ -486,7 +488,7 @@ class EutherLinkTts:
         seed = stable_voice_seed(voice_sample_path, req)
         model_path = os.environ.get("EUTHERLINK_DOTS_TTS_SOAR_PATH", DOTS_TTS_SOAR_PATH)
         language = dots_language(req.language)
-        max_generate_length = max(req.dots_max_generate_length, DOTS_TTS_MIN_GENERATE_LENGTH)
+        max_generate_length = req.dots_max_generate_length
         prompt_audio_path = prepare_dots_prompt_audio(voice_sample_path, job_dir)
         payload = {
             "model_path": model_path,

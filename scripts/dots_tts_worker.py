@@ -16,6 +16,7 @@ from pydantic import BaseModel
 DEFAULT_DOTS_ROOT = Path("/home/nichlas/ai/dots_tts/dots.tts")
 DEFAULT_OUTPUT_DIR = Path("/home/nichlas/EutherLink/data/dots-worker-artifacts")
 DEFAULT_MODEL_PATH = Path("/home/nichlas/ai/dots_tts/models/dots.tts-soar")
+DEFAULT_MAX_GENERATE_LENGTH = 128
 
 
 class RenderRequest(BaseModel):
@@ -24,9 +25,10 @@ class RenderRequest(BaseModel):
 
 
 class DotsWorker:
-    def __init__(self, dots_root: Path, output_dir: Path) -> None:
+    def __init__(self, dots_root: Path, output_dir: Path, max_generate_length: int) -> None:
         self.dots_root = dots_root.resolve()
         self.output_dir = output_dir
+        self.max_generate_length = max_generate_length
         self.lock = threading.Lock()
         self.service = self._build_service()
 
@@ -44,7 +46,7 @@ class DotsWorker:
             execution_mode="generate",
             precision="bfloat16",
             optimize=False,
-            max_generate_length=500,
+            max_generate_length=self.max_generate_length,
             repo_root=self.dots_root,
         )
         return GradioAppService(config)
@@ -143,9 +145,10 @@ def main() -> None:
     parser.add_argument("--port", type=int, default=18765)
     parser.add_argument("--dots-root", type=Path, default=DEFAULT_DOTS_ROOT)
     parser.add_argument("--output-dir", type=Path, default=DEFAULT_OUTPUT_DIR)
+    parser.add_argument("--max-generate-length", type=int, default=DEFAULT_MAX_GENERATE_LENGTH)
     args = parser.parse_args()
 
-    worker = DotsWorker(args.dots_root, args.output_dir)
+    worker = DotsWorker(args.dots_root, args.output_dir, args.max_generate_length)
     uvicorn.run(create_app(worker), host=args.host, port=args.port, log_level="info")
 
 
