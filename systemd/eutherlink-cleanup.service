@@ -1,0 +1,15 @@
+[Unit]
+Description=Clean stale EutherLink transient TTS data
+Wants=eutherlink.service
+
+[Service]
+Type=oneshot
+User=nichlas
+WorkingDirectory=/home/nichlas/EutherLink
+Environment=EUTHERLINK_DATA_DIR=/home/nichlas/EutherLink/data
+Environment=EUTHERLINK_CLEANUP_JOBS_MAX_AGE_HOURS=24
+Environment=EUTHERLINK_CLEANUP_DOTS_ARTIFACTS_MAX_AGE_HOURS=12
+Environment=EUTHERLINK_CLEANUP_MIN_AGE_HOURS=2
+Environment=EUTHERLINK_CLEANUP_JOBS_MAX_BYTES=1500000000
+Environment=EUTHERLINK_CLEANUP_DOTS_ARTIFACTS_MAX_BYTES=500000000
+ExecStart=/home/nichlas/EutherLink/scripts/eutherlink_cleanup.py
