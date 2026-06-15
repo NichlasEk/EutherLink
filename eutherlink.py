@@ -430,6 +430,30 @@ class EutherLinkTts:
             self._write_status(state)
             return state
 
+    def cancel(self, job_id: str, reason: str = "Cancelled by newer request.") -> JobState:
+        with self.jobs_lock:
+            state = self.jobs.get(job_id)
+            if state is None:
+                raise KeyError(job_id)
+            if state.status in {"done", "failed"}:
+                return state
+            state.status = "failed"
+            state.progress = 1.0
+            state.message = "Cancelled"
+            state.error = reason
+            state.updated_at = time.time()
+            self._write_status(state)
+            should_stop_dots = is_dots_backend(state.request.model_backend)
+        if should_stop_dots:
+            self.stop_dots_worker()
+        return state
+
+    def _raise_if_cancelled(self, job_id: str) -> None:
+        with self.jobs_lock:
+            state = self.jobs.get(job_id)
+            if state is not None and state.status == "failed" and str(state.error or "").startswith("Cancelled"):
+                raise RuntimeError(state.error or "Cancelled by newer request.")
+
     def _write_status(self, state: JobState) -> None:
         job_dir = self.jobs_dir / state.id
         job_dir.mkdir(parents=True, exist_ok=True)
@@ -449,6 +473,7 @@ class EutherLinkTts:
 
     def _run_job(self, job_id: str) -> None:
         try:
+            self._raise_if_cancelled(job_id)
             state = self.get(job_id)
             req = state.request
             job_started = time.perf_counter()
@@ -473,6 +498,7 @@ class EutherLinkTts:
             voice_sample_path = write_voice_sample(job_id, self.jobs_dir, req)
             self._merge_perf(job_id, {"eutherlink_voice_sample_sec": time.perf_counter() - sample_start})
             if is_dots_backend(req.model_backend):
+                self._raise_if_cancelled(job_id)
                 self._run_dots_tts_job(job_id, req, chunks, voice_sample_path)
                 return
 
@@ -514,6 +540,7 @@ class EutherLinkTts:
                 initial_prompt_cache = prompt_cache
 
             for index, chunk in enumerate(chunks, start=1):
+                self._raise_if_cancelled(job_id)
                 LOGGER.warning(
                     "TTS_TRACE chunk_start job=%s chunk=%s/%s text_len=%s text_sha=%s seed_effective=%s seed_mode=%s sample_sha=%s prompt_cache=%s",
                     job_id,
@@ -599,6 +626,12 @@ class EutherLinkTts:
             )
             LOGGER.warning("TTS_TRACE done job=%s output=%s", job_id, output_path)
         except Exception as exc:
+            with self.jobs_lock:
+                state = self.jobs.get(job_id)
+                already_cancelled = state is not None and state.status == "failed" and str(state.error or "").startswith("Cancelled")
+            if already_cancelled:
+                LOGGER.warning("TTS_TRACE cancelled job=%s", job_id)
+                return
             LOGGER.exception("TTS_TRACE failed job=%s", job_id)
             self._set_state(
                 job_id,
@@ -670,7 +703,9 @@ class EutherLinkTts:
             progress=0.05,
             message=f"Synthesizing {len(chunks)} chunk(s) with {req.model_backend}",
         )
+        self._raise_if_cancelled(job_id)
         self.render_dots_with_worker(job_id, request_path, dots_dir)
+        self._raise_if_cancelled(job_id)
 
         manifest_path = dots_dir / "manifest.json"
         combine_start = time.perf_counter()
@@ -950,6 +985,14 @@ def build_app(service: EutherLinkTts) -> FastAPI:
     def get_tts_job(job_id: str) -> TtsJobStatus:
         try:
             state = service.get(job_id)
+        except KeyError:
+            raise HTTPException(status_code=404, detail="job not found") from None
+        return status_response(state)
+
+    @app.delete("/v1/tts/jobs/{job_id}", response_model=TtsJobStatus)
+    def cancel_tts_job(job_id: str) -> TtsJobStatus:
+        try:
+            state = service.cancel(job_id)
         except KeyError:
             raise HTTPException(status_code=404, detail="job not found") from None
         return status_response(state)
