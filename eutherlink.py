@@ -6,6 +6,7 @@ import base64
 import binascii
 import concurrent.futures
 import dataclasses
+import gc
 import hashlib
 import json
 import logging
@@ -51,6 +52,8 @@ DOTS_TTS_DEFAULT_GENERATE_LENGTH = 500
 DOTS_TTS_DEFAULT_STEPS = 4
 DOTS_TTS_SAMPLE_RATE = 48_000
 PREWARM_DOTS_DEFAULT = "1"
+OLLAMA_URL = "http://127.0.0.1:11434"
+OLLAMA_AGENT_MODEL = "qwen3-coder:30b"
 
 OutputFormat = Literal["wav", "mp3", "opus"]
 ModelBackend = Literal["voxcpm2", "dots.tts-soar", "dots.tts-mf"]
@@ -102,6 +105,13 @@ class TtsJobStatus(BaseModel):
     audio_url: str | None = None
     partial_audio_urls: list[str] = Field(default_factory=list)
     perf: dict[str, Any] = Field(default_factory=dict)
+
+
+class ResourceActionResult(BaseModel):
+    ok: bool
+    action: str
+    message: str
+    resources: dict[str, Any] = Field(default_factory=dict)
 
 
 @dataclasses.dataclass
@@ -221,6 +231,93 @@ class EutherLinkTts:
             "loaded_model": payload.get("loaded_model"),
             "precision": payload.get("precision"),
             "max_generate_length": payload.get("max_generate_length"),
+        }
+
+    def stop_dots_worker(self, *, require_idle: bool = True) -> dict[str, object]:
+        if require_idle and self.has_active_tts_jobs(model_backends={"dots.tts-soar", "dots.tts-mf"}):
+            raise RuntimeError("Refusing to stop dots.tts while a Dots TTS job is active")
+        with self.dots_worker_lock:
+            process = self.dots_worker_process
+            if process is None or process.poll() is not None:
+                return {"stopped": False, "message": "dots.tts worker is not tracked as running"}
+            process.terminate()
+            try:
+                process.wait(timeout=10)
+            except subprocess.TimeoutExpired:
+                process.kill()
+                process.wait(timeout=10)
+            self.dots_worker_process = None
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+        return {"stopped": True, "message": "dots.tts worker stopped"}
+
+    def unload_voxcpm_model(self, *, require_idle: bool = True) -> dict[str, object]:
+        if require_idle and self.has_active_tts_jobs(model_backends={"voxcpm2"}):
+            raise RuntimeError("Refusing to unload VoxCPM2 while a VoxCPM2 TTS job is active")
+        with self.model_lock:
+            loaded = self.model is not None
+            self.model = None
+        gc.collect()
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+        return {
+            "unloaded": loaded,
+            "message": "VoxCPM2 model unloaded" if loaded else "VoxCPM2 model was not loaded",
+        }
+
+    def stop_ollama_model(self, model: str = OLLAMA_AGENT_MODEL) -> dict[str, object]:
+        try:
+            completed = subprocess.run(
+                ["ollama", "stop", model],
+                check=False,
+                text=True,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                timeout=30,
+            )
+        except (OSError, subprocess.TimeoutExpired) as exc:
+            raise RuntimeError(f"Unable to stop Ollama model {model}: {exc}") from exc
+        if completed.returncode != 0 and "not running" not in completed.stderr.lower():
+            raise RuntimeError((completed.stderr or completed.stdout or f"ollama stop {model} failed").strip())
+        return {
+            "stopped": completed.returncode == 0,
+            "message": (completed.stdout or completed.stderr or f"Ollama model {model} stopped").strip(),
+        }
+
+    def has_active_tts_jobs(self, *, model_backends: set[str] | None = None) -> bool:
+        active_statuses = {"queued", "loading", "running"}
+        with self.jobs_lock:
+            return any(
+                state.status in active_statuses
+                and (model_backends is None or state.request.model_backend in model_backends)
+                for state in self.jobs.values()
+            )
+
+    def list_jobs(self, *, limit: int = 50) -> list[JobState]:
+        states: dict[str, JobState] = {}
+        with self.jobs_lock:
+            states.update(self.jobs)
+        for status_path in self.jobs_dir.glob("*/status.json"):
+            job_id = status_path.parent.name
+            if job_id in states:
+                continue
+            try:
+                states[job_id] = self.get(job_id)
+            except Exception:
+                LOGGER.exception("Failed to load persisted job status: %s", status_path)
+        return sorted(states.values(), key=lambda state: state.updated_at, reverse=True)[:limit]
+
+    def resource_status(self) -> dict[str, Any]:
+        return {
+            "tts": {
+                "queued_or_running": sum(
+                    1 for job in self.jobs.values() if job.status in {"queued", "loading", "running"}
+                ),
+                "voxcpm_loaded": self.model is not None,
+                "dots_tts": self.dots_worker_status(),
+            },
+            "ollama": ollama_status(),
+            "gpu": gpu_status(),
         }
 
     def prewarm_dots_worker(self) -> None:
@@ -971,6 +1068,49 @@ def build_app(service: EutherLinkTts) -> FastAPI:
             "dots_tts": service.dots_worker_status(),
         }
 
+    @app.get("/v1/resources")
+    def get_resources() -> dict[str, Any]:
+        return service.resource_status()
+
+    @app.post("/v1/resources/dots.tts/stop", response_model=ResourceActionResult)
+    def stop_dots_worker() -> ResourceActionResult:
+        try:
+            result = service.stop_dots_worker(require_idle=True)
+        except RuntimeError as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
+        return ResourceActionResult(
+            ok=True,
+            action="stop_dots_worker",
+            message=str(result.get("message", "dots.tts stop requested")),
+            resources=service.resource_status(),
+        )
+
+    @app.post("/v1/resources/voxcpm2/unload", response_model=ResourceActionResult)
+    def unload_voxcpm2() -> ResourceActionResult:
+        try:
+            result = service.unload_voxcpm_model(require_idle=True)
+        except RuntimeError as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
+        return ResourceActionResult(
+            ok=True,
+            action="unload_voxcpm2",
+            message=str(result.get("message", "VoxCPM2 unload requested")),
+            resources=service.resource_status(),
+        )
+
+    @app.post("/v1/resources/ollama/{model_name:path}/stop", response_model=ResourceActionResult)
+    def stop_ollama_model(model_name: str) -> ResourceActionResult:
+        try:
+            result = service.stop_ollama_model(model_name)
+        except RuntimeError as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
+        return ResourceActionResult(
+            ok=True,
+            action="stop_ollama_model",
+            message=str(result.get("message", f"Ollama model {model_name} stop requested")),
+            resources=service.resource_status(),
+        )
+
     @app.post("/v1/tts/jobs", response_model=TtsJobAccepted)
     def create_tts_job(request: TtsJobRequest) -> TtsJobAccepted:
         state = service.submit(request)
@@ -980,6 +1120,11 @@ def build_app(service: EutherLinkTts) -> FastAPI:
             status_url=f"/v1/tts/jobs/{state.id}",
             audio_url=f"/v1/tts/jobs/{state.id}/audio",
         )
+
+    @app.get("/v1/tts/jobs", response_model=list[TtsJobStatus])
+    def list_tts_jobs(limit: int = 50) -> list[TtsJobStatus]:
+        limit = max(1, min(limit, 200))
+        return [status_response(state) for state in service.list_jobs(limit=limit)]
 
     @app.get("/v1/tts/jobs/{job_id}", response_model=TtsJobStatus)
     def get_tts_job(job_id: str) -> TtsJobStatus:
@@ -1046,6 +1191,51 @@ def status_response(state: JobState) -> TtsJobStatus:
         partial_audio_urls=partial_audio_urls,
         perf=state.perf,
     )
+
+
+def ollama_status() -> dict[str, Any]:
+    try:
+        with urllib.request.urlopen(f"{OLLAMA_URL}/api/ps", timeout=1.0) as response:
+            payload = json.loads(response.read().decode("utf-8"))
+    except Exception as exc:
+        return {
+            "ok": False,
+            "status": "unavailable",
+            "error": f"{type(exc).__name__}: {exc}",
+            "default_model": os.environ.get("EUTHERLINK_OLLAMA_AGENT_MODEL", OLLAMA_AGENT_MODEL),
+        }
+    return {
+        "ok": True,
+        "status": "ready",
+        "default_model": os.environ.get("EUTHERLINK_OLLAMA_AGENT_MODEL", OLLAMA_AGENT_MODEL),
+        "models": payload.get("models", []),
+    }
+
+
+def gpu_status() -> dict[str, Any]:
+    try:
+        completed = subprocess.run(
+            [
+                "nvidia-smi",
+                "--query-gpu=memory.used,memory.total,utilization.gpu,temperature.gpu",
+                "--format=csv,noheader,nounits",
+            ],
+            check=True,
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            timeout=5,
+        )
+        fields = [field.strip() for field in completed.stdout.strip().split(",", maxsplit=3)]
+        return {
+            "ok": True,
+            "memory_used_mib": int(fields[0]),
+            "memory_total_mib": int(fields[1]),
+            "utilization_gpu_percent": int(fields[2]),
+            "temperature_c": int(fields[3]),
+        }
+    except Exception as exc:
+        return {"ok": False, "error": f"{type(exc).__name__}: {exc}"}
 
 
 def main() -> None:
