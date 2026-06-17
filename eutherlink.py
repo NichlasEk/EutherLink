@@ -8,6 +8,7 @@ import concurrent.futures
 import dataclasses
 import gc
 import hashlib
+import importlib.util
 import json
 import logging
 import os
@@ -51,12 +52,18 @@ DOTS_TTS_MODEL_MAX_WORDS = 180
 DOTS_TTS_DEFAULT_GENERATE_LENGTH = 500
 DOTS_TTS_DEFAULT_STEPS = 4
 DOTS_TTS_SAMPLE_RATE = 48_000
+GRAPHENE_MATCHA_ROOT = "/home/nichlas/SpeechServices"
+GRAPHENE_MATCHA_ENCODER = "app/src/main/res/raw/encoder.onnx"
+GRAPHENE_MATCHA_DECODER = "app/src/main/res/raw/decoder.onnx"
+GRAPHENE_MATCHA_G2P = "app/src/main/res/raw/en_us__g2p.onnx"
+GRAPHENE_MATCHA_CONFIG = "app/src/main/res/raw/en_us__g2p__config.json"
+GRAPHENE_MATCHA_SAMPLE_RATE = 22_050
 PREWARM_DOTS_DEFAULT = "1"
 OLLAMA_URL = "http://127.0.0.1:11434"
 OLLAMA_AGENT_MODEL = "qwen3-coder:30b"
 
 OutputFormat = Literal["wav", "mp3", "opus"]
-ModelBackend = Literal["voxcpm2", "dots.tts-soar", "dots.tts-mf"]
+ModelBackend = Literal["voxcpm2", "dots.tts-soar", "dots.tts-mf", "grapheneos-matcha-en"]
 DotsTemplateName = Literal["tts", "instruction_tts", "text_to_audio", "tts_interleave"]
 DotsOdeMethod = Literal["euler", "midpoint"]
 
@@ -326,6 +333,7 @@ class EutherLinkTts:
                 "voxcpm_loaded": self.model is not None,
                 "dots_tts": self.dots_worker_status(),
                 "dots_render_job_id": self.dots_render_job_id,
+                "grapheneos_matcha": grapheneos_matcha_status(),
             },
             "ollama": ollama_status(),
             "gpu": gpu_status(),
@@ -618,6 +626,9 @@ class EutherLinkTts:
                     "eutherlink_split_sec": time.perf_counter() - job_started,
                 },
             )
+            if is_graphene_matcha_backend(req.model_backend):
+                self._run_graphene_matcha_job(job_id)
+                return
 
             sample_start = time.perf_counter()
             voice_sample_path = write_voice_sample(job_id, self.jobs_dir, req)
@@ -883,6 +894,25 @@ class EutherLinkTts:
         )
         LOGGER.warning("TTS_TRACE dots_done job=%s output=%s", job_id, output_path)
 
+    def _run_graphene_matcha_job(self, job_id: str) -> None:
+        status = grapheneos_matcha_status()
+        missing = [key for key, value in status.items() if key.startswith("has_") and not value]
+        if not status.get("runtime_available"):
+            missing.append("runtime_available")
+        if not status.get("renderer_available"):
+            missing.append("renderer_available")
+        detail = ", ".join(missing) if missing else "renderer unavailable"
+        self._set_state(
+            job_id,
+            status="loading",
+            progress=0.02,
+            message="GrapheneOS Matcha fallback selected",
+        )
+        raise RuntimeError(
+            "grapheneos-matcha-en is wired as a fallback target, but the server renderer is not ready "
+            f"({detail}). Assets are expected under {GRAPHENE_MATCHA_ROOT}."
+        )
+
 
 def write_voice_sample(job_id: str, jobs_dir: Path, req: TtsJobRequest) -> Path | None:
     sample_base64 = req.prompt_wav_base64 or req.reference_wav_base64
@@ -1030,6 +1060,38 @@ def is_dots_backend(model_backend: str) -> bool:
     return model_backend in {"dots.tts-soar", "dots.tts-mf"}
 
 
+def is_graphene_matcha_backend(model_backend: str) -> bool:
+    return model_backend == "grapheneos-matcha-en"
+
+
+def grapheneos_matcha_status() -> dict[str, object]:
+    root = Path(os.environ.get("EUTHERLINK_GRAPHENE_MATCHA_ROOT", GRAPHENE_MATCHA_ROOT))
+    encoder = root / GRAPHENE_MATCHA_ENCODER
+    decoder = root / GRAPHENE_MATCHA_DECODER
+    g2p = root / GRAPHENE_MATCHA_G2P
+    config = root / GRAPHENE_MATCHA_CONFIG
+    runtime_available = importlib.util.find_spec("onnxruntime") is not None
+    assets_ready = root.is_dir() and encoder.is_file() and decoder.is_file() and g2p.is_file() and config.is_file()
+    return {
+        "ok": False,
+        "status": "wired" if assets_ready else "missing-assets",
+        "voice": "en_US",
+        "sample_rate": GRAPHENE_MATCHA_SAMPLE_RATE,
+        "root": str(root),
+        "has_root": root.is_dir(),
+        "has_encoder": encoder.is_file(),
+        "has_decoder": decoder.is_file(),
+        "has_g2p": g2p.is_file(),
+        "has_config": config.is_file(),
+        "runtime": "onnxruntime",
+        "runtime_available": runtime_available,
+        "renderer_available": False,
+        "message": "GrapheneOS Matcha assets are detected, but Linux rendering still needs ONNX Runtime and a phonemizer port."
+        if assets_ready
+        else "GrapheneOS Matcha assets were not found at the configured root.",
+    }
+
+
 def dots_model_path(model_backend: str) -> str:
     if model_backend == "dots.tts-mf":
         return os.environ.get("EUTHERLINK_DOTS_TTS_MF_PATH", DOTS_TTS_MF_PATH)
@@ -1095,6 +1157,7 @@ def build_app(service: EutherLinkTts) -> FastAPI:
             "queued_or_running": sum(1 for job in service.jobs.values() if job.status in {"queued", "loading", "running"}),
             "tts_parallelism": tts_parallelism(),
             "dots_tts": service.dots_worker_status(),
+            "grapheneos_matcha": grapheneos_matcha_status(),
         }
 
     @app.get("/v1/resources")

@@ -5,7 +5,8 @@ machine and letting smaller Euther services call it over HTTP.
 
 The first worker is VoxCPM2 text-to-speech for audiobook-style rendering.
 `dots.tts-soar` and `dots.tts-mf` are also available as optional backends through the separate
-library under `/home/nichlas/ai/dots_tts`.
+library under `/home/nichlas/ai/dots_tts`. `grapheneos-matcha-en` is reserved
+for the English GrapheneOS Matcha fallback target under `/home/nichlas/SpeechServices`.
 
 ## Start
 
@@ -70,3 +71,17 @@ Use SOAR by setting `"model_backend": "dots.tts-soar"` or the faster MeanFlow
 student by setting `"model_backend": "dots.tts-mf"`. Dots requires a reference
 WAV and matching `prompt_text`, so send either `prompt_wav_base64` or
 `reference_wav_base64`.
+
+## GrapheneOS Matcha Fallback Target
+
+The fallback backend id is:
+
+```json
+{"model_backend": "grapheneos-matcha-en"}
+```
+
+EutherLink reports its current readiness in `GET /health` and `GET /v1/resources`
+as `grapheneos_matcha`. The first slice detects the GrapheneOS Speech Services
+assets under `/home/nichlas/SpeechServices` and fails selected jobs with a clear
+runtime error until the Linux renderer is completed. Rendering still needs a
+server-side ONNX Runtime plus a port of the Android phonemizer path.
