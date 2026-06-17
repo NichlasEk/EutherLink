@@ -72,6 +72,10 @@ student by setting `"model_backend": "dots.tts-mf"`. Dots requires a reference
 WAV and matching `prompt_text`, so send either `prompt_wav_base64` or
 `reference_wav_base64`.
 
+Use `"model_backend": "auto-fallback"` to prefer Dots MF while the main Dots
+queue is below `EUTHERLINK_DOTS_MAIN_QUEUE_LIMIT` (default `2`) and route English
+overflow jobs to GrapheneOS Matcha when it is ready.
+
 ## GrapheneOS Matcha Fallback Target
 
 The fallback backend id is:

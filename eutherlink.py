@@ -64,7 +64,7 @@ OLLAMA_URL = "http://127.0.0.1:11434"
 OLLAMA_AGENT_MODEL = "qwen3-coder:30b"
 
 OutputFormat = Literal["wav", "mp3", "opus"]
-ModelBackend = Literal["voxcpm2", "dots.tts-soar", "dots.tts-mf", "grapheneos-matcha-en"]
+ModelBackend = Literal["voxcpm2", "dots.tts-soar", "dots.tts-mf", "grapheneos-matcha-en", "auto-fallback"]
 DotsTemplateName = Literal["tts", "instruction_tts", "text_to_audio", "tts_interleave"]
 DotsOdeMethod = Literal["euler", "midpoint"]
 
@@ -72,6 +72,13 @@ DotsOdeMethod = Literal["euler", "midpoint"]
 def tts_parallelism() -> int:
     try:
         return max(1, int(os.environ.get("EUTHERLINK_TTS_PARALLELISM", "2")))
+    except ValueError:
+        return 2
+
+
+def dots_main_queue_limit() -> int:
+    try:
+        return max(1, int(os.environ.get("EUTHERLINK_DOTS_MAIN_QUEUE_LIMIT", "2")))
     except ValueError:
         return 2
 
@@ -310,6 +317,16 @@ class EutherLinkTts:
                 for state in self.jobs.values()
             )
 
+    def active_tts_job_count(self, *, model_backends: set[str] | None = None) -> int:
+        active_statuses = {"queued", "loading", "running"}
+        with self.jobs_lock:
+            return sum(
+                1
+                for state in self.jobs.values()
+                if state.status in active_statuses
+                and (model_backends is None or state.request.model_backend in model_backends)
+            )
+
     def list_jobs(self, *, limit: int = 50) -> list[JobState]:
         states: dict[str, JobState] = {}
         with self.jobs_lock:
@@ -331,6 +348,7 @@ class EutherLinkTts:
                     1 for job in self.jobs.values() if job.status in {"queued", "loading", "running"}
                 ),
                 "parallelism": tts_parallelism(),
+                "dots_main_queue_limit": dots_main_queue_limit(),
                 "voxcpm_loaded": self.model is not None,
                 "dots_tts": self.dots_worker_status(),
                 "dots_render_job_id": self.dots_render_job_id,
@@ -494,13 +512,16 @@ class EutherLinkTts:
 
     def submit(self, request: TtsJobRequest) -> JobState:
         job_id = uuid.uuid4().hex
+        requested_model_backend = request.model_backend
+        request = self.resolve_auto_fallback(request)
         state = JobState(id=job_id, request=request)
         with self.jobs_lock:
             self.jobs[job_id] = state
         LOGGER.warning(
-            "TTS_TRACE submit job=%s backend=%s lang=%s fmt=%s text_len=%s text_sha=%s seed_request=%s cfg=%.3f steps=%s dots_guidance=%.3f dots_speaker=%.3f dots_steps=%s dots_max_len=%s max_chunk_chars=%s has_prompt=%s has_reference=%s voice_instruction_sha=%s",
+            "TTS_TRACE submit job=%s backend=%s requested_backend=%s lang=%s fmt=%s text_len=%s text_sha=%s seed_request=%s cfg=%.3f steps=%s dots_guidance=%.3f dots_speaker=%.3f dots_steps=%s dots_max_len=%s max_chunk_chars=%s has_prompt=%s has_reference=%s voice_instruction_sha=%s",
             job_id,
             request.model_backend,
+            requested_model_backend,
             request.language,
             request.output_format,
             len(request.text),
@@ -519,6 +540,23 @@ class EutherLinkTts:
         )
         self.executor.submit(self._run_job, job_id)
         return state
+
+    def resolve_auto_fallback(self, request: TtsJobRequest) -> TtsJobRequest:
+        if request.model_backend != "auto-fallback":
+            return request
+        dots_active = self.active_tts_job_count(model_backends={"dots.tts-soar", "dots.tts-mf"})
+        language = request.language.strip().lower()
+        can_use_matcha = language.startswith("en") and bool(grapheneos_matcha_status().get("ready"))
+        resolved = "grapheneos-matcha-en" if can_use_matcha and dots_active >= dots_main_queue_limit() else "dots.tts-mf"
+        LOGGER.warning(
+            "TTS_TRACE auto_fallback_resolve requested=auto-fallback resolved=%s lang=%s dots_active=%s dots_limit=%s matcha_ready=%s",
+            resolved,
+            request.language,
+            dots_active,
+            dots_main_queue_limit(),
+            can_use_matcha,
+        )
+        return request.model_copy(update={"model_backend": resolved})
 
     def get(self, job_id: str) -> JobState:
         with self.jobs_lock:
@@ -1125,6 +1163,10 @@ def dots_language(language: str) -> str | None:
 
 def is_dots_backend(model_backend: str) -> bool:
     return model_backend in {"dots.tts-soar", "dots.tts-mf"}
+
+
+def is_auto_fallback_backend(model_backend: str) -> bool:
+    return model_backend == "auto-fallback"
 
 
 def is_graphene_matcha_backend(model_backend: str) -> bool:
