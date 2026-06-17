@@ -61,6 +61,13 @@ DotsTemplateName = Literal["tts", "instruction_tts", "text_to_audio", "tts_inter
 DotsOdeMethod = Literal["euler", "midpoint"]
 
 
+def tts_parallelism() -> int:
+    try:
+        return max(1, int(os.environ.get("EUTHERLINK_TTS_PARALLELISM", "2")))
+    except ValueError:
+        return 2
+
+
 class TtsJobRequest(BaseModel):
     text: str = Field(min_length=1, max_length=250_000)
     voice_instruction: str = Field(
@@ -144,8 +151,10 @@ class EutherLinkTts:
         self.model_lock = threading.Lock()
         self.model: VoxCPM | None = None
         self.dots_worker_lock = threading.Lock()
+        self.dots_render_lock = threading.Lock()
+        self.dots_render_job_id: str | None = None
         self.dots_worker_process: subprocess.Popen[bytes] | None = None
-        self.executor = concurrent.futures.ThreadPoolExecutor(max_workers=1)
+        self.executor = concurrent.futures.ThreadPoolExecutor(max_workers=tts_parallelism())
 
         self.jobs_dir = config.data_dir / "jobs"
         self.jobs_dir.mkdir(parents=True, exist_ok=True)
@@ -313,8 +322,10 @@ class EutherLinkTts:
                 "queued_or_running": sum(
                     1 for job in self.jobs.values() if job.status in {"queued", "loading", "running"}
                 ),
+                "parallelism": tts_parallelism(),
                 "voxcpm_loaded": self.model is not None,
                 "dots_tts": self.dots_worker_status(),
+                "dots_render_job_id": self.dots_render_job_id,
             },
             "ollama": ollama_status(),
             "gpu": gpu_status(),
@@ -347,27 +358,44 @@ class EutherLinkTts:
                 "progress_json": str(progress_path),
             }
         ).encode("utf-8")
-        with concurrent.futures.ThreadPoolExecutor(max_workers=1) as executor:
-            future = executor.submit(self._post_dots_render, payload)
-            last_progress_signature: tuple[int, int, str, int, int, int] | None = None
-            while True:
-                try:
-                    response_status = future.result(timeout=0.5)
-                    if response_status != 200:
-                        raise RuntimeError(f"dots.tts worker returned HTTP {response_status}")
-                    self._sync_dots_progress(job_id, progress_path, force=True)
-                    self._merge_perf(
-                        job_id,
-                        {
-                            "eutherlink_worker_render_wait_sec": time.perf_counter() - started,
-                            "eutherlink_worker_http_status": response_status,
-                        },
-                    )
-                    return
-                except concurrent.futures.TimeoutError:
-                    signature = self._sync_dots_progress(job_id, progress_path, last_progress_signature)
-                    if signature is not None:
-                        last_progress_signature = signature
+        wait_started = time.perf_counter()
+        while not self.dots_render_lock.acquire(timeout=0.5):
+            self._raise_if_cancelled(job_id)
+            self._set_state(
+                job_id,
+                status="running",
+                progress=0.05,
+                message="Waiting for Dots render slot",
+            )
+        wait_sec = time.perf_counter() - wait_started
+        self.dots_render_job_id = job_id
+        try:
+            with concurrent.futures.ThreadPoolExecutor(max_workers=1) as executor:
+                future = executor.submit(self._post_dots_render, payload)
+                last_progress_signature: tuple[int, int, str, int, int, int] | None = None
+                while True:
+                    try:
+                        response_status = future.result(timeout=0.5)
+                        if response_status != 200:
+                            raise RuntimeError(f"dots.tts worker returned HTTP {response_status}")
+                        self._sync_dots_progress(job_id, progress_path, force=True)
+                        self._merge_perf(
+                            job_id,
+                            {
+                                "eutherlink_worker_render_wait_sec": time.perf_counter() - started,
+                                "eutherlink_dots_render_slot_wait_sec": wait_sec,
+                                "eutherlink_worker_http_status": response_status,
+                            },
+                        )
+                        return
+                    except concurrent.futures.TimeoutError:
+                        self._raise_if_cancelled(job_id)
+                        signature = self._sync_dots_progress(job_id, progress_path, last_progress_signature)
+                        if signature is not None:
+                            last_progress_signature = signature
+        finally:
+            self.dots_render_job_id = None
+            self.dots_render_lock.release()
 
     def _post_dots_render(self, payload: bytes) -> int:
         request = urllib.request.Request(
@@ -1065,6 +1093,7 @@ def build_app(service: EutherLinkTts) -> FastAPI:
             "service": "EutherLink",
             "model": service.config.model_path,
             "queued_or_running": sum(1 for job in service.jobs.values() if job.status in {"queued", "loading", "running"}),
+            "tts_parallelism": tts_parallelism(),
             "dots_tts": service.dots_worker_status(),
         }
 

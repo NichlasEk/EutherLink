@@ -19,6 +19,16 @@ Default bind:
 0.0.0.0:8765
 ```
 
+Default TTS scheduling:
+
+```text
+EUTHERLINK_TTS_PARALLELISM=2
+```
+
+Two EutherLink TTS jobs can be active at once. Dots jobs still use a single
+protected render slot around the persistent Dots worker, so a second Dots job is
+accepted and reports `Waiting for Dots render slot` instead of racing the model.
+
 ## Health
 
 ```sh
