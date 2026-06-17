@@ -81,7 +81,14 @@ The fallback backend id is:
 ```
 
 EutherLink reports its current readiness in `GET /health` and `GET /v1/resources`
-as `grapheneos_matcha`. The first slice detects the GrapheneOS Speech Services
-assets under `/home/nichlas/SpeechServices` and fails selected jobs with a clear
-runtime error until the Linux renderer is completed. Rendering still needs a
-server-side ONNX Runtime plus a port of the Android phonemizer path.
+as `grapheneos_matcha`. The renderer uses the GrapheneOS Speech Services ONNX
+encoder/decoder assets and an isolated Python 3.12 runtime:
+
+```sh
+uv venv --python 3.12 .venv-matcha
+uv pip install --python .venv-matcha/bin/python onnxruntime 'misaki[en]' soundfile click
+VIRTUAL_ENV=$PWD/.venv-matcha PATH=$PWD/.venv-matcha/bin:$PATH \
+  .venv-matcha/bin/python -m spacy download en_core_web_sm
+```
+
+Use `"model_backend": "grapheneos-matcha-en"` for the English fallback voice.

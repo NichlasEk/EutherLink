@@ -8,7 +8,6 @@ import concurrent.futures
 import dataclasses
 import gc
 import hashlib
-import importlib.util
 import json
 import logging
 import os
@@ -58,6 +57,8 @@ GRAPHENE_MATCHA_DECODER = "app/src/main/res/raw/decoder.onnx"
 GRAPHENE_MATCHA_G2P = "app/src/main/res/raw/en_us__g2p.onnx"
 GRAPHENE_MATCHA_CONFIG = "app/src/main/res/raw/en_us__g2p__config.json"
 GRAPHENE_MATCHA_SAMPLE_RATE = 22_050
+GRAPHENE_MATCHA_PYTHON = "/home/nichlas/EutherLink/.venv-matcha/bin/python"
+GRAPHENE_MATCHA_RENDERER = "/home/nichlas/EutherLink/scripts/render_graphene_matcha.py"
 PREWARM_DOTS_DEFAULT = "1"
 OLLAMA_URL = "http://127.0.0.1:11434"
 OLLAMA_AGENT_MODEL = "qwen3-coder:30b"
@@ -627,7 +628,7 @@ class EutherLinkTts:
                 },
             )
             if is_graphene_matcha_backend(req.model_backend):
-                self._run_graphene_matcha_job(job_id)
+                self._run_graphene_matcha_job(job_id, req)
                 return
 
             sample_start = time.perf_counter()
@@ -894,24 +895,90 @@ class EutherLinkTts:
         )
         LOGGER.warning("TTS_TRACE dots_done job=%s output=%s", job_id, output_path)
 
-    def _run_graphene_matcha_job(self, job_id: str) -> None:
+    def _run_graphene_matcha_job(self, job_id: str, req: TtsJobRequest) -> None:
         status = grapheneos_matcha_status()
-        missing = [key for key, value in status.items() if key.startswith("has_") and not value]
-        if not status.get("runtime_available"):
-            missing.append("runtime_available")
-        if not status.get("renderer_available"):
-            missing.append("renderer_available")
-        detail = ", ".join(missing) if missing else "renderer unavailable"
+        if not status.get("ready"):
+            missing = [key for key, value in status.items() if key.startswith("has_") and not value]
+            if not status.get("runtime_available"):
+                missing.append("runtime_available")
+            if not status.get("renderer_available"):
+                missing.append("renderer_available")
+            detail = ", ".join(missing) if missing else "renderer unavailable"
+            raise RuntimeError(
+                "grapheneos-matcha-en is selected, but the server renderer is not ready "
+                f"({detail}). Assets are expected under {GRAPHENE_MATCHA_ROOT}."
+            )
+
+        job_dir = self.jobs_dir / job_id
+        matcha_dir = job_dir / req.model_backend
+        matcha_dir.mkdir(parents=True, exist_ok=True)
+        request_path = matcha_dir / "request.json"
+        wav_path = job_dir / "audio.wav"
+        manifest_path = matcha_dir / "manifest.json"
+        request_path.write_text(
+            json.dumps(
+                {
+                    "text": req.text,
+                    "language": req.language,
+                    "length_scale": 1.0,
+                    "assets_dir": str(Path(graphene_matcha_root()) / "app/src/main/res/raw"),
+                },
+                ensure_ascii=False,
+                indent=2,
+            ),
+            encoding="utf-8",
+        )
+        self._set_state(job_id, status="running", progress=0.05, message="Synthesizing with GrapheneOS Matcha")
+        started = time.perf_counter()
+        env = os.environ.copy()
+        env["VIRTUAL_ENV"] = str(Path(GRAPHENE_MATCHA_PYTHON).parent.parent)
+        env["PATH"] = f"{Path(GRAPHENE_MATCHA_PYTHON).parent}:{env.get('PATH', '')}"
+        env.setdefault("CUDA_VISIBLE_DEVICES", "")
+        completed = subprocess.run(
+            [
+                GRAPHENE_MATCHA_PYTHON,
+                GRAPHENE_MATCHA_RENDERER,
+                "--request-json",
+                str(request_path),
+                "--output-wav",
+                str(wav_path),
+                "--manifest-json",
+                str(manifest_path),
+            ],
+            check=False,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            env=env,
+        )
+        if completed.returncode != 0:
+            stderr = completed.stderr.strip()[-4000:]
+            raise RuntimeError(f"GrapheneOS Matcha renderer failed with code {completed.returncode}: {stderr}")
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+        perf = manifest.get("perf") if isinstance(manifest.get("perf"), dict) else {}
+        self._merge_perf(
+            job_id,
+            {
+                "eutherlink_graphene_total_sec": time.perf_counter() - started,
+                "graphene_duration_sec": manifest.get("duration_sec"),
+                "graphene_chunk_count": perf.get("chunk_count"),
+            },
+        )
+
+        if req.output_format == "wav":
+            output_path = wav_path
+        else:
+            output_path = self.audio_path(job_id)
+            encode_audio(wav_path, output_path, req.output_format)
         self._set_state(
             job_id,
-            status="loading",
-            progress=0.02,
-            message="GrapheneOS Matcha fallback selected",
+            status="done",
+            progress=1.0,
+            message=f"Audio ready: {output_path.name}",
+            error=None,
+            partial_audio_files=[],
         )
-        raise RuntimeError(
-            "grapheneos-matcha-en is wired as a fallback target, but the server renderer is not ready "
-            f"({detail}). Assets are expected under {GRAPHENE_MATCHA_ROOT}."
-        )
+        LOGGER.warning("TTS_TRACE graphene_matcha_done job=%s output=%s", job_id, output_path)
 
 
 def write_voice_sample(job_id: str, jobs_dir: Path, req: TtsJobRequest) -> Path | None:
@@ -1064,20 +1131,31 @@ def is_graphene_matcha_backend(model_backend: str) -> bool:
     return model_backend == "grapheneos-matcha-en"
 
 
+def graphene_matcha_root() -> str:
+    return os.environ.get("EUTHERLINK_GRAPHENE_MATCHA_ROOT", GRAPHENE_MATCHA_ROOT)
+
+
 def grapheneos_matcha_status() -> dict[str, object]:
-    root = Path(os.environ.get("EUTHERLINK_GRAPHENE_MATCHA_ROOT", GRAPHENE_MATCHA_ROOT))
+    root = Path(graphene_matcha_root())
     encoder = root / GRAPHENE_MATCHA_ENCODER
     decoder = root / GRAPHENE_MATCHA_DECODER
     g2p = root / GRAPHENE_MATCHA_G2P
     config = root / GRAPHENE_MATCHA_CONFIG
-    runtime_available = importlib.util.find_spec("onnxruntime") is not None
+    python_path = Path(os.environ.get("EUTHERLINK_GRAPHENE_MATCHA_PYTHON", GRAPHENE_MATCHA_PYTHON))
+    renderer_path = Path(os.environ.get("EUTHERLINK_GRAPHENE_MATCHA_RENDERER", GRAPHENE_MATCHA_RENDERER))
+    runtime_available = python_path.is_file()
+    renderer_available = renderer_path.is_file()
     assets_ready = root.is_dir() and encoder.is_file() and decoder.is_file() and g2p.is_file() and config.is_file()
+    ready = assets_ready and runtime_available and renderer_available
     return {
-        "ok": False,
-        "status": "wired" if assets_ready else "missing-assets",
+        "ok": ready,
+        "ready": ready,
+        "status": "ready" if ready else "wired" if assets_ready else "missing-assets",
         "voice": "en_US",
         "sample_rate": GRAPHENE_MATCHA_SAMPLE_RATE,
         "root": str(root),
+        "python": str(python_path),
+        "renderer": str(renderer_path),
         "has_root": root.is_dir(),
         "has_encoder": encoder.is_file(),
         "has_decoder": decoder.is_file(),
@@ -1085,8 +1163,10 @@ def grapheneos_matcha_status() -> dict[str, object]:
         "has_config": config.is_file(),
         "runtime": "onnxruntime",
         "runtime_available": runtime_available,
-        "renderer_available": False,
-        "message": "GrapheneOS Matcha assets are detected, but Linux rendering still needs ONNX Runtime and a phonemizer port."
+        "renderer_available": renderer_available,
+        "message": "GrapheneOS Matcha renderer is ready."
+        if ready
+        else "GrapheneOS Matcha assets are detected, but Linux rendering still needs the local .venv-matcha runtime."
         if assets_ready
         else "GrapheneOS Matcha assets were not found at the configured root.",
     }
