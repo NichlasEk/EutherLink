@@ -3,13 +3,27 @@ set -euo pipefail
 
 cd "$(dirname "$0")"
 
-VOXCPM_ROOT="${VOXCPM_ROOT:-/home/nichlas/ai/voxcpm2/VoxCPM}"
-PYTHON="${PYTHON:-$VOXCPM_ROOT/.venv/bin/python}"
+export EUTHERLINK_CONFIG="${EUTHERLINK_CONFIG:-$PWD/eutherlink.toml}"
 
-export PYTHONPATH="$VOXCPM_ROOT/src${PYTHONPATH:+:$PYTHONPATH}"
-export EUTHERLINK_HOST="${EUTHERLINK_HOST:-0.0.0.0}"
-export EUTHERLINK_PORT="${EUTHERLINK_PORT:-8765}"
-export EUTHERLINK_DATA_DIR="${EUTHERLINK_DATA_DIR:-/home/nichlas/EutherLink/data}"
-export EUTHERLINK_MODEL_PATH="${EUTHERLINK_MODEL_PATH:-/home/nichlas/.cache/huggingface/hub/models--openbmb--VoxCPM2/snapshots/e8b928065859f2869644c1e2881cbd21f888c659}"
+toml_value() {
+  python - "$EUTHERLINK_CONFIG" "$1" "$2" <<'PY'
+import sys
+import tomllib
+
+path, section, key = sys.argv[1:4]
+with open(path, "rb") as handle:
+    config = tomllib.load(handle)
+value = config.get(section, {}).get(key, "")
+if value is not None:
+    print(value)
+PY
+}
+
+PYTHON="${PYTHON:-$(toml_value server python)}"
+PYTHON="${PYTHON:-python}"
+CONFIG_PYTHONPATH="$(toml_value server pythonpath)"
+if [[ -n "$CONFIG_PYTHONPATH" ]]; then
+  export PYTHONPATH="$CONFIG_PYTHONPATH${PYTHONPATH:+:$PYTHONPATH}"
+fi
 
 exec "$PYTHON" eutherlink.py "$@"

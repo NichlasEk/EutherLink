@@ -1,0 +1,28 @@
+[server]
+host = "0.0.0.0"
+port = 8765
+data_dir = "/home/nichlas/EutherLink/data"
+model_path = "/home/nichlas/.cache/huggingface/hub/models--openbmb--VoxCPM2/snapshots/e8b928065859f2869644c1e2881cbd21f888c659"
+python = "/home/nichlas/ai/voxcpm2/VoxCPM/.venv/bin/python"
+pythonpath = "/home/nichlas/ai/voxcpm2/VoxCPM/src"
+
+[dots_tts]
+root = "/home/nichlas/ai/dots_tts/dots.tts"
+python = "/home/nichlas/ai/dots_tts/dots.tts/.venv/bin/python"
+soar_model_path = "/home/nichlas/ai/dots_tts/models/dots.tts-soar"
+mf_model_path = "/home/nichlas/ai/dots_tts/models/dots.tts-mf"
+temp_output_dir = "/run/media/nichlas/Titan/EutherBooksTemp/dots_tts_outputs"
+
+[grapheneos_matcha]
+root = "/home/nichlas/SpeechServices"
+python = "/home/nichlas/EutherLink/.venv-matcha/bin/python"
+renderer = "/home/nichlas/EutherLink/scripts/render_graphene_matcha.py"
+
+[cleanup]
+jobs_max_age_hours = 24
+dots_artifacts_max_age_hours = 12
+dots_temp_outputs_max_age_hours = 6
+min_age_hours = 2
+jobs_max_bytes = 1500000000
+dots_artifacts_max_bytes = 500000000
+dots_temp_outputs_max_bytes = 2000000000

@@ -191,7 +191,7 @@ def main() -> int:
     args = parser.parse_args()
 
     request = json.loads(Path(args.request_json).read_text(encoding="utf-8"))
-    root = Path(request.get("assets_dir") or "/home/nichlas/SpeechServices/app/src/main/res/raw")
+    root = Path(request.get("assets_dir") or os.environ.get("EUTHERLINK_GRAPHENE_MATCHA_ASSETS_DIR", ""))
     text = str(request["text"])
     length_scale = float(request.get("length_scale") or 1.0)
 

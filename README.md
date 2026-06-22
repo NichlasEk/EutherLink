@@ -8,6 +8,10 @@ The first worker is VoxCPM2 text-to-speech for audiobook-style rendering.
 library under `/home/nichlas/ai/dots_tts`. `grapheneos-matcha-en` is reserved
 for the English GrapheneOS Matcha fallback target under `/home/nichlas/SpeechServices`.
 
+Runtime paths and cleanup limits live in `eutherlink.toml`. Environment
+variables and CLI flags can still override those values for one-off tests, but
+normal service defaults should be changed in the TOML file.
+
 ## Start
 
 ```sh

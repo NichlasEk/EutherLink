@@ -4,6 +4,7 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
+import os
 import sys
 from pathlib import Path
 from typing import Any
@@ -11,7 +12,7 @@ from typing import Any
 import soundfile as sf
 
 
-DEFAULT_DOTS_ROOT = Path("/home/nichlas/ai/dots_tts/dots.tts")
+DEFAULT_DOTS_ROOT = Path(os.environ.get("EUTHERLINK_DOTS_TTS_ROOT", "."))
 
 
 def main() -> None:

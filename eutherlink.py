@@ -16,6 +16,7 @@ import re
 import subprocess
 import threading
 import time
+import tomllib
 import urllib.error
 import urllib.request
 import uuid
@@ -33,33 +34,31 @@ from voxcpm import VoxCPM
 
 
 LOGGER = logging.getLogger("eutherlink")
+REPO_ROOT = Path(__file__).resolve().parent
 
-DEFAULT_MODEL_PATH = (
-    "/home/nichlas/.cache/huggingface/hub/models--openbmb--VoxCPM2/"
-    "snapshots/e8b928065859f2869644c1e2881cbd21f888c659"
-)
-DEFAULT_DATA_DIR = "/home/nichlas/EutherLink/data"
-DOTS_TTS_PYTHON = "/home/nichlas/ai/dots_tts/dots.tts/.venv/bin/python"
-DOTS_TTS_RENDERER = "/home/nichlas/EutherLink/scripts/render_dots_tts.py"
-DOTS_TTS_WORKER = "/home/nichlas/EutherLink/scripts/dots_tts_worker.py"
-DOTS_TTS_SOAR_PATH = "/home/nichlas/ai/dots_tts/models/dots.tts-soar"
-DOTS_TTS_MF_PATH = "/home/nichlas/ai/dots_tts/models/dots.tts-mf"
+DEFAULT_MODEL_PATH = ""
+DEFAULT_DATA_DIR = str(REPO_ROOT / "data")
+DEFAULT_CONFIG_PATH = REPO_ROOT / "eutherlink.toml"
+DOTS_TTS_PYTHON = "python"
+DOTS_TTS_RENDERER = str(REPO_ROOT / "scripts" / "render_dots_tts.py")
+DOTS_TTS_WORKER = str(REPO_ROOT / "scripts" / "dots_tts_worker.py")
+DOTS_TTS_SOAR_PATH = ""
+DOTS_TTS_MF_PATH = ""
 DOTS_TTS_WORKER_URL = "http://127.0.0.1:18765"
 DOTS_TTS_MAX_WORDS = 120
 DOTS_TTS_MIN_WORDS = 40
 DOTS_TTS_MODEL_MAX_WORDS = 180
 DOTS_TTS_DEFAULT_GENERATE_LENGTH = 500
-DOTS_TTS_TEMP_OUTPUT_DIR = "/run/media/nichlas/Titan/EutherBooksTemp/dots_tts_outputs"
 DOTS_TTS_DEFAULT_STEPS = 4
 DOTS_TTS_SAMPLE_RATE = 48_000
-GRAPHENE_MATCHA_ROOT = "/home/nichlas/SpeechServices"
+GRAPHENE_MATCHA_ROOT = ""
 GRAPHENE_MATCHA_ENCODER = "app/src/main/res/raw/encoder.onnx"
 GRAPHENE_MATCHA_DECODER = "app/src/main/res/raw/decoder.onnx"
 GRAPHENE_MATCHA_G2P = "app/src/main/res/raw/en_us__g2p.onnx"
 GRAPHENE_MATCHA_CONFIG = "app/src/main/res/raw/en_us__g2p__config.json"
 GRAPHENE_MATCHA_SAMPLE_RATE = 22_050
-GRAPHENE_MATCHA_PYTHON = "/home/nichlas/EutherLink/.venv-matcha/bin/python"
-GRAPHENE_MATCHA_RENDERER = "/home/nichlas/EutherLink/scripts/render_graphene_matcha.py"
+GRAPHENE_MATCHA_PYTHON = "python"
+GRAPHENE_MATCHA_RENDERER = str(REPO_ROOT / "scripts" / "render_graphene_matcha.py")
 PREWARM_DOTS_DEFAULT = "1"
 OLLAMA_URL = "http://127.0.0.1:11434"
 OLLAMA_AGENT_MODEL = "qwen3-coder:30b"
@@ -143,6 +142,7 @@ class RuntimeConfig:
     data_dir: Path
     host: str
     port: int
+    dots_temp_output_dir: Path | None = None
 
 
 @dataclasses.dataclass
@@ -202,22 +202,26 @@ class EutherLinkTts:
 
             worker_env = os.environ.copy()
             worker_env.setdefault("NUMBA_CACHE_DIR", str(self.config.data_dir / "numba-cache"))
-            worker_env.setdefault("DOTS_TTS_TEMP_OUTPUT_DIR", DOTS_TTS_TEMP_OUTPUT_DIR)
+            if self.config.dots_temp_output_dir is not None:
+                worker_env.setdefault("DOTS_TTS_TEMP_OUTPUT_DIR", str(self.config.dots_temp_output_dir))
+            dots_worker = os.environ.get("EUTHERLINK_DOTS_TTS_WORKER", DOTS_TTS_WORKER)
             dots_generate_length = int(os.environ.get("EUTHERLINK_DOTS_TTS_MAX_GENERATE_LENGTH", DOTS_TTS_DEFAULT_GENERATE_LENGTH))
             self.dots_worker_process = subprocess.Popen(
                 [
                     os.environ.get("EUTHERLINK_DOTS_TTS_PYTHON", DOTS_TTS_PYTHON),
-                    os.environ.get("EUTHERLINK_DOTS_TTS_WORKER", DOTS_TTS_WORKER),
+                    dots_worker,
                     "--host",
                     "127.0.0.1",
                     "--port",
                     "18765",
+                    "--dots-root",
+                    os.environ.get("EUTHERLINK_DOTS_TTS_ROOT", ""),
                     "--output-dir",
                     str(self.config.data_dir / "dots-worker-artifacts"),
                     "--max-generate-length",
                     str(dots_generate_length),
                 ],
-                cwd=str(Path(DOTS_TTS_WORKER).resolve().parent),
+                cwd=str(Path(dots_worker).resolve().parent),
                 env=worker_env,
             )
 
@@ -1454,20 +1458,76 @@ def gpu_status() -> dict[str, Any]:
         return {"ok": False, "error": f"{type(exc).__name__}: {exc}"}
 
 
+def load_toml_config(path: Path) -> dict[str, Any]:
+    if not path.exists():
+        return {}
+    with path.open("rb") as handle:
+        loaded = tomllib.load(handle)
+    if not isinstance(loaded, dict):
+        raise ValueError(f"Config file did not contain a TOML table: {path}")
+    return loaded
+
+
+def config_get(config: dict[str, Any], section: str, key: str, default: Any = None) -> Any:
+    value = config.get(section, {})
+    if not isinstance(value, dict):
+        return default
+    return value.get(key, default)
+
+
+def env_or_config(env_name: str, config: dict[str, Any], section: str, key: str, default: Any = None) -> Any:
+    env_value = os.environ.get(env_name)
+    if env_value is not None:
+        return env_value
+    return config_get(config, section, key, default)
+
+
+def set_env_default_from_config(env_name: str, config: dict[str, Any], section: str, key: str) -> None:
+    if os.environ.get(env_name):
+        return
+    value = config_get(config, section, key)
+    if value is not None and str(value).strip():
+        os.environ[env_name] = str(value)
+
+
 def main() -> None:
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s %(message)s")
-    parser = argparse.ArgumentParser(description="EutherLink local service host")
-    parser.add_argument("--host", default=os.environ.get("EUTHERLINK_HOST", "0.0.0.0"))
-    parser.add_argument("--port", type=int, default=int(os.environ.get("EUTHERLINK_PORT", "8765")))
-    parser.add_argument("--model-path", default=os.environ.get("EUTHERLINK_MODEL_PATH", DEFAULT_MODEL_PATH))
-    parser.add_argument("--data-dir", default=os.environ.get("EUTHERLINK_DATA_DIR", DEFAULT_DATA_DIR))
-    args = parser.parse_args()
+    config_parser = argparse.ArgumentParser(add_help=False)
+    config_parser.add_argument("--config", default=os.environ.get("EUTHERLINK_CONFIG", str(DEFAULT_CONFIG_PATH)))
+    config_args, remaining_args = config_parser.parse_known_args()
+    toml_config = load_toml_config(Path(config_args.config))
+
+    parser = argparse.ArgumentParser(description="EutherLink local service host", parents=[config_parser])
+    parser.add_argument("--host", default=env_or_config("EUTHERLINK_HOST", toml_config, "server", "host", "0.0.0.0"))
+    parser.add_argument("--port", type=int, default=int(env_or_config("EUTHERLINK_PORT", toml_config, "server", "port", "8765")))
+    parser.add_argument(
+        "--model-path",
+        default=env_or_config("EUTHERLINK_MODEL_PATH", toml_config, "server", "model_path", DEFAULT_MODEL_PATH),
+    )
+    parser.add_argument(
+        "--data-dir",
+        default=env_or_config("EUTHERLINK_DATA_DIR", toml_config, "server", "data_dir", DEFAULT_DATA_DIR),
+    )
+    parser.add_argument(
+        "--dots-temp-output-dir",
+        default=env_or_config("DOTS_TTS_TEMP_OUTPUT_DIR", toml_config, "dots_tts", "temp_output_dir"),
+    )
+    args = parser.parse_args(remaining_args)
+    set_env_default_from_config("EUTHERLINK_DOTS_TTS_ROOT", toml_config, "dots_tts", "root")
+    set_env_default_from_config("EUTHERLINK_DOTS_TTS_PYTHON", toml_config, "dots_tts", "python")
+    set_env_default_from_config("EUTHERLINK_DOTS_TTS_SOAR_PATH", toml_config, "dots_tts", "soar_model_path")
+    set_env_default_from_config("EUTHERLINK_DOTS_TTS_MF_PATH", toml_config, "dots_tts", "mf_model_path")
+    set_env_default_from_config("EUTHERLINK_DOTS_TTS_DEFAULT_MODEL_PATH", toml_config, "dots_tts", "mf_model_path")
+    set_env_default_from_config("EUTHERLINK_GRAPHENE_MATCHA_ROOT", toml_config, "grapheneos_matcha", "root")
+    set_env_default_from_config("EUTHERLINK_GRAPHENE_MATCHA_PYTHON", toml_config, "grapheneos_matcha", "python")
+    set_env_default_from_config("EUTHERLINK_GRAPHENE_MATCHA_RENDERER", toml_config, "grapheneos_matcha", "renderer")
 
     config = RuntimeConfig(
         model_path=args.model_path,
         data_dir=Path(args.data_dir),
         host=args.host,
         port=args.port,
+        dots_temp_output_dir=Path(args.dots_temp_output_dir) if args.dots_temp_output_dir else None,
     )
     service = EutherLinkTts(config)
 

@@ -20,9 +20,9 @@ from pydantic import BaseModel
 import soundfile as sf
 
 
-DEFAULT_DOTS_ROOT = Path("/home/nichlas/ai/dots_tts/dots.tts")
-DEFAULT_OUTPUT_DIR = Path("/home/nichlas/EutherLink/data/dots-worker-artifacts")
-DEFAULT_MODEL_PATH = Path(os.environ.get("EUTHERLINK_DOTS_TTS_DEFAULT_MODEL_PATH", "/home/nichlas/ai/dots_tts/models/dots.tts-mf"))
+DEFAULT_DOTS_ROOT = Path(os.environ.get("EUTHERLINK_DOTS_TTS_ROOT", "."))
+DEFAULT_OUTPUT_DIR = Path(os.environ.get("EUTHERLINK_DOTS_TTS_OUTPUT_DIR", "data/dots-worker-artifacts"))
+DEFAULT_MODEL_PATH = Path(os.environ.get("EUTHERLINK_DOTS_TTS_DEFAULT_MODEL_PATH", ""))
 DEFAULT_MAX_GENERATE_LENGTH = 500
 DEFAULT_STREAM_PART_SECONDS = 8.0
 
