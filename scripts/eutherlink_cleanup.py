@@ -11,11 +11,14 @@ from pathlib import Path
 
 
 DEFAULT_DATA_DIR = Path("/home/nichlas/EutherLink/data")
+DEFAULT_DOTS_TEMP_OUTPUT_DIR = Path("/run/media/nichlas/Titan/EutherBooksTemp/dots_tts_outputs")
 DEFAULT_JOBS_MAX_AGE_HOURS = 24
 DEFAULT_DOTS_ARTIFACTS_MAX_AGE_HOURS = 12
+DEFAULT_DOTS_TEMP_OUTPUTS_MAX_AGE_HOURS = 6
 DEFAULT_MIN_AGE_HOURS = 2
 DEFAULT_JOBS_MAX_BYTES = 1_500_000_000
 DEFAULT_DOTS_ARTIFACTS_MAX_BYTES = 500_000_000
+DEFAULT_DOTS_TEMP_OUTPUTS_MAX_BYTES = 2_000_000_000
 
 
 @dataclass(frozen=True)
@@ -53,6 +56,21 @@ def main() -> int:
         ),
     )
     parser.add_argument(
+        "--dots-temp-output-dir",
+        type=Path,
+        default=Path(os.environ.get("DOTS_TTS_TEMP_OUTPUT_DIR", DEFAULT_DOTS_TEMP_OUTPUT_DIR)),
+    )
+    parser.add_argument(
+        "--dots-temp-outputs-max-age-hours",
+        type=float,
+        default=float(
+            os.environ.get(
+                "EUTHERLINK_CLEANUP_DOTS_TEMP_OUTPUTS_MAX_AGE_HOURS",
+                DEFAULT_DOTS_TEMP_OUTPUTS_MAX_AGE_HOURS,
+            ),
+        ),
+    )
+    parser.add_argument(
         "--min-age-hours",
         type=float,
         default=float(os.environ.get("EUTHERLINK_CLEANUP_MIN_AGE_HOURS", DEFAULT_MIN_AGE_HOURS)),
@@ -67,6 +85,16 @@ def main() -> int:
         type=int,
         default=int(os.environ.get("EUTHERLINK_CLEANUP_DOTS_ARTIFACTS_MAX_BYTES", DEFAULT_DOTS_ARTIFACTS_MAX_BYTES)),
     )
+    parser.add_argument(
+        "--dots-temp-outputs-max-bytes",
+        type=int,
+        default=int(
+            os.environ.get(
+                "EUTHERLINK_CLEANUP_DOTS_TEMP_OUTPUTS_MAX_BYTES",
+                DEFAULT_DOTS_TEMP_OUTPUTS_MAX_BYTES,
+            ),
+        ),
+    )
     parser.add_argument("--dry-run", action="store_true", default=os.environ.get("EUTHERLINK_CLEANUP_DRY_RUN") == "1")
     args = parser.parse_args()
 
@@ -80,10 +108,17 @@ def main() -> int:
             args.dots_artifacts_max_bytes,
             args.min_age_hours,
         ),
+        CleanupTarget(
+            "dots-temp-outputs",
+            args.dots_temp_output_dir,
+            args.dots_temp_outputs_max_age_hours,
+            args.dots_temp_outputs_max_bytes,
+            args.min_age_hours,
+        ),
     ]
 
     for target in targets:
-        _validate_target(data_dir, target.path, target.max_age_hours)
+        _validate_target(data_dir, args.dots_temp_output_dir.resolve(), target.path, target.max_age_hours)
 
     total = CleanupStats()
     for target in targets:
@@ -105,10 +140,12 @@ def main() -> int:
     return 0
 
 
-def _validate_target(data_dir: Path, path: Path, max_age_hours: float) -> None:
+def _validate_target(data_dir: Path, dots_temp_output_dir: Path, path: Path, max_age_hours: float) -> None:
     if max_age_hours < 1:
         raise SystemExit(f"Refusing cleanup with max age below 1 hour for {path}")
     resolved = path.resolve()
+    if resolved == dots_temp_output_dir:
+        return
     if data_dir not in resolved.parents:
         raise SystemExit(f"Refusing cleanup outside data dir: {resolved}")
 

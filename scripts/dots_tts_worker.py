@@ -6,6 +6,7 @@ import hashlib
 import json
 import os
 import re
+import shutil
 import sys
 import threading
 import time
@@ -48,6 +49,7 @@ class DotsWorker:
 
         from apps.gradio.service import GradioAppService, build_gradio_app_config
 
+        self._patch_temp_output_root(GradioAppService)
         config = build_gradio_app_config(
             model_name_or_path=str(DEFAULT_MODEL_PATH),
             output_dir=self.output_dir,
@@ -58,6 +60,19 @@ class DotsWorker:
             repo_root=self.dots_root,
         )
         return GradioAppService(config)
+
+    @staticmethod
+    def _patch_temp_output_root(service_cls: Any) -> None:
+        temp_output_dir = os.environ.get("DOTS_TTS_TEMP_OUTPUT_DIR", "").strip()
+        if not temp_output_dir:
+            return
+        temp_root = Path(temp_output_dir)
+
+        def build_temp_root() -> Path:
+            temp_root.mkdir(parents=True, exist_ok=True)
+            return temp_root
+
+        service_cls._build_temp_root = staticmethod(build_temp_root)  # noqa: SLF001
 
     def preload(self) -> dict[str, Any]:
         with self.lock:
@@ -369,18 +384,21 @@ class DotsWorker:
 
         audio = torch.cat(full_chunks, dim=-1)
         artifact_start = time.perf_counter()
+        request_id = self.service._build_stream_request_id(runtime, normalized_request)  # noqa: SLF001
         artifact_paths = self.service._write_generation_artifacts(  # noqa: SLF001
-            request_id=self.service._build_stream_request_id(runtime, normalized_request),  # noqa: SLF001
+            request_id=request_id,
             audio=audio,
             sample_rate=sample_rate,
             request=normalized_request,
             resolved_model_name_or_path=str(resolved_model),
         )
+        temp_cleanup_count = self._cleanup_temp_output_dirs(request_id)
         artifact_sec = time.perf_counter() - artifact_start
         total_sec = time.perf_counter() - started
         audio_sec = generated_samples / sample_rate
+        audio_path = artifact_paths.get("persistent_output_path") or artifact_paths["output_path"]
         return SynthesisResult(
-            audio_path=str(artifact_paths["output_path"]),
+            audio_path=str(audio_path),
             metrics={
                 "sample_rate": sample_rate,
                 "stream_partial_count": len(partial_paths),
@@ -391,11 +409,32 @@ class DotsWorker:
                 "first_audio_sec": first_audio_sec,
                 "runtime_lookup_sec": runtime_sec,
                 "artifact_write_sec": artifact_sec,
+                "temp_cleanup_count": temp_cleanup_count,
                 "partial_write_sec": partial_write_sec,
                 "stream_part_seconds": stream_part_seconds(),
             },
             status="ok",
         )
+
+    def _cleanup_temp_output_dirs(self, request_id: str) -> int:
+        try:
+            temp_root = self.service._build_temp_root().resolve()  # noqa: SLF001
+        except Exception:
+            return 0
+        marker = f"-{request_id}-"
+        removed = 0
+        for child in temp_root.iterdir():
+            try:
+                if not child.is_dir() or marker not in child.name:
+                    continue
+                resolved = child.resolve()
+                if temp_root not in resolved.parents:
+                    continue
+                shutil.rmtree(resolved)
+                removed += 1
+            except OSError:
+                continue
+        return removed
 
     @staticmethod
     def _write_partial_audio(partial_dir: Path, chunk_index: int, partial_index: int, chunks: list[torch.Tensor], sample_rate: int) -> str:

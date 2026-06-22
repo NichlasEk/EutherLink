@@ -49,6 +49,7 @@ DOTS_TTS_MAX_WORDS = 120
 DOTS_TTS_MIN_WORDS = 40
 DOTS_TTS_MODEL_MAX_WORDS = 180
 DOTS_TTS_DEFAULT_GENERATE_LENGTH = 500
+DOTS_TTS_TEMP_OUTPUT_DIR = "/run/media/nichlas/Titan/EutherBooksTemp/dots_tts_outputs"
 DOTS_TTS_DEFAULT_STEPS = 4
 DOTS_TTS_SAMPLE_RATE = 48_000
 GRAPHENE_MATCHA_ROOT = "/home/nichlas/SpeechServices"
@@ -201,6 +202,7 @@ class EutherLinkTts:
 
             worker_env = os.environ.copy()
             worker_env.setdefault("NUMBA_CACHE_DIR", str(self.config.data_dir / "numba-cache"))
+            worker_env.setdefault("DOTS_TTS_TEMP_OUTPUT_DIR", DOTS_TTS_TEMP_OUTPUT_DIR)
             dots_generate_length = int(os.environ.get("EUTHERLINK_DOTS_TTS_MAX_GENERATE_LENGTH", DOTS_TTS_DEFAULT_GENERATE_LENGTH))
             self.dots_worker_process = subprocess.Popen(
                 [
