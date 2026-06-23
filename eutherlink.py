@@ -115,6 +115,11 @@ class TtsJobAccepted(BaseModel):
     audio_url: str
 
 
+class HeavyTtsSuspendRequest(BaseModel):
+    seconds: int = Field(default=900, ge=30, le=7200)
+    reason: str = Field(default="image_generation", max_length=120)
+
+
 class TtsJobStatus(BaseModel):
     id: str
     status: str
@@ -170,6 +175,8 @@ class EutherLinkTts:
         self.dots_render_lock = threading.Lock()
         self.dots_render_job_id: str | None = None
         self.dots_worker_process: subprocess.Popen[bytes] | None = None
+        self.heavy_tts_suspended_until = 0.0
+        self.heavy_tts_suspend_reason = ""
         self.executor = concurrent.futures.ThreadPoolExecutor(max_workers=tts_parallelism())
 
         self.jobs_dir = config.data_dir / "jobs"
@@ -189,6 +196,8 @@ class EutherLinkTts:
         return self.model
 
     def ensure_dots_worker(self) -> None:
+        if self.heavy_tts_suspended():
+            raise RuntimeError("dots.tts is temporarily suspended for GPU image generation")
         with self.dots_worker_lock:
             if self._dots_worker_healthy(timeout=0.5):
                 return
@@ -281,6 +290,26 @@ class EutherLinkTts:
             torch.cuda.empty_cache()
         return {"stopped": True, "message": "dots.tts worker stopped"}
 
+    def suspend_heavy_tts(self, *, seconds: int, reason: str) -> dict[str, object]:
+        now = time.time()
+        until = now + max(30, min(seconds, 7200))
+        self.heavy_tts_suspended_until = until
+        self.heavy_tts_suspend_reason = reason.strip() or "image_generation"
+        stopped = self.stop_dots_worker(require_idle=True)
+        return {
+            "suspended_until": until,
+            "seconds": int(until - now),
+            "reason": self.heavy_tts_suspend_reason,
+            "dots": stopped,
+        }
+
+    def heavy_tts_suspended(self) -> bool:
+        if self.heavy_tts_suspended_until <= time.time():
+            self.heavy_tts_suspended_until = 0.0
+            self.heavy_tts_suspend_reason = ""
+            return False
+        return True
+
     def unload_voxcpm_model(self, *, require_idle: bool = True) -> dict[str, object]:
         if require_idle and self.has_active_tts_jobs(model_backends={"voxcpm2"}):
             raise RuntimeError("Refusing to unload VoxCPM2 while a VoxCPM2 TTS job is active")
@@ -348,6 +377,7 @@ class EutherLinkTts:
         return sorted(states.values(), key=lambda state: state.updated_at, reverse=True)[:limit]
 
     def resource_status(self) -> dict[str, Any]:
+        heavy_tts_suspended = self.heavy_tts_suspended()
         return {
             "tts": {
                 "queued_or_running": sum(
@@ -355,6 +385,9 @@ class EutherLinkTts:
                 ),
                 "parallelism": tts_parallelism(),
                 "dots_main_queue_limit": dots_main_queue_limit(),
+                "heavy_tts_suspended": heavy_tts_suspended,
+                "heavy_tts_suspended_until": self.heavy_tts_suspended_until if heavy_tts_suspended else None,
+                "heavy_tts_suspend_reason": self.heavy_tts_suspend_reason if heavy_tts_suspended else "",
                 "voxcpm_loaded": self.model is not None,
                 "dots_tts": self.dots_worker_status(),
                 "dots_render_job_id": self.dots_render_job_id,
@@ -365,6 +398,9 @@ class EutherLinkTts:
         }
 
     def prewarm_dots_worker(self) -> None:
+        if self.heavy_tts_suspended():
+            LOGGER.warning("TTS_TRACE dots_prewarm_skipped heavy_tts_suspended=true")
+            return
         try:
             self.ensure_dots_worker()
             request = urllib.request.Request(
@@ -548,19 +584,40 @@ class EutherLinkTts:
         return state
 
     def resolve_auto_fallback(self, request: TtsJobRequest) -> TtsJobRequest:
+        if is_dots_backend(request.model_backend) and self.heavy_tts_suspended():
+            if bool(grapheneos_matcha_status().get("ready")):
+                LOGGER.warning(
+                    "TTS_TRACE heavy_tts_suspended_resolve requested=%s resolved=grapheneos-matcha-en lang=%s reason=%s",
+                    request.model_backend,
+                    request.language,
+                    self.heavy_tts_suspend_reason,
+                )
+                return request.model_copy(update={"model_backend": "grapheneos-matcha-en"})
+            LOGGER.warning(
+                "TTS_TRACE heavy_tts_suspended_no_matcha requested=%s lang=%s reason=%s",
+                request.model_backend,
+                request.language,
+                self.heavy_tts_suspend_reason,
+            )
         if request.model_backend != "auto-fallback":
             return request
         dots_active = self.active_tts_job_count(model_backends={"dots.tts-soar", "dots.tts-mf"})
         language = request.language.strip().lower()
         can_use_matcha = language.startswith("en") and bool(grapheneos_matcha_status().get("ready"))
-        resolved = "grapheneos-matcha-en" if can_use_matcha and dots_active >= dots_main_queue_limit() else "dots.tts-mf"
+        heavy_tts_suspended = self.heavy_tts_suspended()
+        resolved = (
+            "grapheneos-matcha-en"
+            if can_use_matcha and (heavy_tts_suspended or dots_active >= dots_main_queue_limit())
+            else "dots.tts-mf"
+        )
         LOGGER.warning(
-            "TTS_TRACE auto_fallback_resolve requested=auto-fallback resolved=%s lang=%s dots_active=%s dots_limit=%s matcha_ready=%s",
+            "TTS_TRACE auto_fallback_resolve requested=auto-fallback resolved=%s lang=%s dots_active=%s dots_limit=%s matcha_ready=%s heavy_tts_suspended=%s",
             resolved,
             request.language,
             dots_active,
             dots_main_queue_limit(),
             can_use_matcha,
+            heavy_tts_suspended,
         )
         return request.model_copy(update={"model_backend": resolved})
 
@@ -950,7 +1007,7 @@ class EutherLinkTts:
             detail = ", ".join(missing) if missing else "renderer unavailable"
             raise RuntimeError(
                 "grapheneos-matcha-en is selected, but the server renderer is not ready "
-                f"({detail}). Assets are expected under {GRAPHENE_MATCHA_ROOT}."
+                f"({detail}). Assets are expected under {graphene_matcha_root()}."
             )
 
         job_dir = self.jobs_dir / job_id
@@ -975,13 +1032,15 @@ class EutherLinkTts:
         self._set_state(job_id, status="running", progress=0.05, message="Synthesizing with GrapheneOS Matcha")
         started = time.perf_counter()
         env = os.environ.copy()
-        env["VIRTUAL_ENV"] = str(Path(GRAPHENE_MATCHA_PYTHON).parent.parent)
-        env["PATH"] = f"{Path(GRAPHENE_MATCHA_PYTHON).parent}:{env.get('PATH', '')}"
+        matcha_python = Path(os.environ.get("EUTHERLINK_GRAPHENE_MATCHA_PYTHON", GRAPHENE_MATCHA_PYTHON))
+        matcha_renderer = Path(os.environ.get("EUTHERLINK_GRAPHENE_MATCHA_RENDERER", GRAPHENE_MATCHA_RENDERER))
+        env["VIRTUAL_ENV"] = str(matcha_python.parent.parent)
+        env["PATH"] = f"{matcha_python.parent}:{env.get('PATH', '')}"
         env.setdefault("CUDA_VISIBLE_DEVICES", "")
         completed = subprocess.run(
             [
-                GRAPHENE_MATCHA_PYTHON,
-                GRAPHENE_MATCHA_RENDERER,
+                str(matcha_python),
+                str(matcha_renderer),
                 "--request-json",
                 str(request_path),
                 "--output-wav",
@@ -1291,6 +1350,22 @@ def build_app(service: EutherLinkTts) -> FastAPI:
     @app.get("/v1/resources")
     def get_resources() -> dict[str, Any]:
         return service.resource_status()
+
+    @app.post("/v1/resources/heavy-tts/suspend", response_model=ResourceActionResult)
+    def suspend_heavy_tts(request: HeavyTtsSuspendRequest) -> ResourceActionResult:
+        try:
+            result = service.suspend_heavy_tts(seconds=request.seconds, reason=request.reason)
+        except RuntimeError as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
+        return ResourceActionResult(
+            ok=True,
+            action="suspend_heavy_tts",
+            message=(
+                f"heavy TTS suspended for {result.get('seconds')}s; "
+                f"new Dots requests can fall back to GrapheneOS Matcha"
+            ),
+            resources=service.resource_status(),
+        )
 
     @app.post("/v1/resources/dots.tts/stop", response_model=ResourceActionResult)
     def stop_dots_worker() -> ResourceActionResult:
