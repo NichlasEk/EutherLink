@@ -576,6 +576,63 @@ class EutherLinkTts:
             self.resource_condition.notify_all()
             return job
 
+    def acquire_tts_gpu_job(self, job_id: str, request: TtsJobRequest) -> dict[str, Any]:
+        label = f"EutherLink TTS {request.model_backend} {job_id}"
+        scheduler_job = self.create_gpu_job(
+            GpuJobRequest(
+                owner="eutherlink-tts",
+                owner_id=job_id,
+                label=label,
+                kind="tts",
+                priority=40,
+                ttl_seconds=7200,
+                metadata={
+                    "backend": request.model_backend,
+                    "language": request.language,
+                },
+            )
+        )
+        deadline = time.time() + float(os.environ.get("EUTHERLINK_GPU_SCHEDULER_WAIT_SECONDS", "7200"))
+        while scheduler_job.get("status") == "queued" and time.time() < deadline:
+            self._set_state(
+                job_id,
+                status="queued",
+                progress=0.01,
+                message="Waiting for global GPU scheduler",
+            )
+            time.sleep(2)
+            scheduler_job = self.get_gpu_job(str(scheduler_job["id"]))
+        if scheduler_job.get("status") != "running":
+            raise RuntimeError(f"GPU scheduler did not grant TTS slot: {scheduler_job}")
+        self._set_state(
+            job_id,
+            status="loading",
+            progress=0.01,
+            message="Global GPU slot acquired",
+        )
+        return scheduler_job
+
+    def start_tts_gpu_heartbeat(self, job_id: str, gpu_job_id: str) -> threading.Event:
+        stop = threading.Event()
+
+        def loop() -> None:
+            while not stop.wait(30):
+                try:
+                    state = self.get(job_id)
+                    self.heartbeat_gpu_job(
+                        gpu_job_id,
+                        GpuJobUpdateRequest(
+                            progress=state.progress,
+                            message=state.message or state.status,
+                            ttl_seconds=7200,
+                        ),
+                    )
+                except Exception as exc:
+                    LOGGER.warning("TTS_TRACE gpu_heartbeat_failed job=%s gpu_job=%s error=%s", job_id, gpu_job_id, exc)
+
+        threading.Thread(target=loop, name=f"tts-gpu-heartbeat-{job_id}", daemon=True).start()
+        return stop
+
     def _promote_gpu_jobs_locked(self) -> None:
         now = time.time()
         current = self._read_gpu_lease()
@@ -1054,6 +1111,8 @@ class EutherLinkTts:
             state = self.get(job_id)
             req = state.request
             job_started = time.perf_counter()
+            gpu_job: dict[str, Any] | None = None
+            heartbeat_stop: threading.Event | None = None
             self._set_state(job_id, status="loading", progress=0.01, message="Preparing TTS job")
 
             chunks = (
@@ -1077,9 +1136,22 @@ class EutherLinkTts:
             sample_start = time.perf_counter()
             voice_sample_path = write_voice_sample(job_id, self.jobs_dir, req)
             self._merge_perf(job_id, {"eutherlink_voice_sample_sec": time.perf_counter() - sample_start})
+            gpu_job = self.acquire_tts_gpu_job(job_id, req)
+            heartbeat_stop = self.start_tts_gpu_heartbeat(job_id, str(gpu_job["id"]))
             if is_dots_backend(req.model_backend):
-                self._raise_if_cancelled(job_id)
-                self._run_dots_tts_job(job_id, req, chunks, voice_sample_path)
+                try:
+                    self._raise_if_cancelled(job_id)
+                    self._run_dots_tts_job(job_id, req, chunks, voice_sample_path)
+                    self.release_gpu_job(str(gpu_job["id"]), status="done", message="done")
+                    gpu_job = None
+                    heartbeat_stop.set()
+                    heartbeat_stop = None
+                except Exception:
+                    self.release_gpu_job(str(gpu_job["id"]), status="failed", message="failed")
+                    gpu_job = None
+                    heartbeat_stop.set()
+                    heartbeat_stop = None
+                    raise
                 return
 
             self._set_state(job_id, status="loading", progress=0.01, message="Loading VoxCPM2")
@@ -1204,8 +1276,19 @@ class EutherLinkTts:
                 progress=1.0,
                 message=f"Done: {output_path.name}",
             )
+            self.release_gpu_job(str(gpu_job["id"]), status="done", message="done")
+            gpu_job = None
+            heartbeat_stop.set()
+            heartbeat_stop = None
             LOGGER.warning("TTS_TRACE done job=%s output=%s", job_id, output_path)
         except Exception as exc:
+            if heartbeat_stop is not None:
+                heartbeat_stop.set()
+            if gpu_job is not None:
+                try:
+                    self.release_gpu_job(str(gpu_job["id"]), status="failed", message=f"{type(exc).__name__}: {exc}")
+                except Exception as release_exc:
+                    LOGGER.warning("TTS_TRACE gpu_release_failed job=%s error=%s", job_id, release_exc)
             with self.jobs_lock:
                 state = self.jobs.get(job_id)
                 already_cancelled = state is not None and state.status == "failed" and str(state.error or "").startswith("Cancelled")
