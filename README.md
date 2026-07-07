@@ -100,3 +100,43 @@ VIRTUAL_ENV=$PWD/.venv-matcha PATH=$PWD/.venv-matcha/bin:$PATH \
 ```
 
 Use `"model_backend": "grapheneos-matcha-en"` for the English fallback voice.
+
+## Global GPU Scheduler
+
+Long-running local GPU clients should reserve the RTX 4090 through EutherLink
+instead of loading models opportunistically. The persistent scheduler survives
+EutherLink restarts and stores job records under `data/gpu-jobs/`.
+
+Create a scheduler job:
+
+```sh
+curl -s http://127.0.0.1:8765/v1/gpu/jobs \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "owner": "eutherstudio",
+    "owner_id": "studio-job-123",
+    "label": "EutherStudio ACE-Step",
+    "priority": 60,
+    "ttl_seconds": 7200
+  }'
+```
+
+Poll the returned job until `status` is `running`, then start the model work.
+While running, send heartbeats:
+
+```sh
+curl -s http://127.0.0.1:8765/v1/gpu/jobs/JOB_ID/heartbeat \
+  -H 'Content-Type: application/json' \
+  -d '{"progress": 0.4, "message": "rendering", "ttl_seconds": 7200}'
+```
+
+Release the GPU when complete:
+
+```sh
+curl -s -X POST http://127.0.0.1:8765/v1/gpu/jobs/JOB_ID/release \
+  -H 'Content-Type: application/json' \
+  -d '{"message": "done"}'
+```
+
+Use `GET /v1/gpu/jobs` and `GET /v1/resources` to inspect the active owner and
+waiting queue.

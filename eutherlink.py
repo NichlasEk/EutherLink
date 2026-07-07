@@ -120,6 +120,59 @@ class HeavyTtsSuspendRequest(BaseModel):
     reason: str = Field(default="image_generation", max_length=120)
 
 
+class GpuLeaseRequest(BaseModel):
+    owner: str = Field(min_length=1, max_length=80)
+    owner_id: str = Field(min_length=1, max_length=160)
+    label: str = Field(default="", max_length=200)
+    priority: int = Field(default=50, ge=0, le=100)
+    ttl_seconds: int = Field(default=3600, ge=30, le=24 * 3600)
+    wait_seconds: int = Field(default=0, ge=0, le=24 * 3600)
+
+
+class GpuLeaseResponse(BaseModel):
+    ok: bool
+    status: str
+    lease: dict[str, Any] | None = None
+    message: str = ""
+    resources: dict[str, Any] = Field(default_factory=dict)
+
+
+class GpuJobRequest(BaseModel):
+    owner: str = Field(min_length=1, max_length=80)
+    owner_id: str | None = Field(default=None, max_length=160)
+    label: str = Field(default="", max_length=200)
+    kind: str = Field(default="gpu", max_length=80)
+    priority: int = Field(default=50, ge=0, le=100)
+    ttl_seconds: int = Field(default=3600, ge=30, le=24 * 3600)
+    metadata: dict[str, Any] = Field(default_factory=dict)
+
+
+class GpuJobUpdateRequest(BaseModel):
+    progress: float | None = Field(default=None, ge=0.0, le=1.0)
+    message: str = Field(default="", max_length=500)
+    ttl_seconds: int | None = Field(default=None, ge=30, le=24 * 3600)
+
+
+class GpuJobStatus(BaseModel):
+    id: str
+    owner: str
+    owner_id: str
+    label: str
+    kind: str
+    priority: int
+    status: str
+    progress: float
+    message: str
+    created_at: float
+    updated_at: float
+    started_at: float | None = None
+    finished_at: float | None = None
+    expires_at: float | None = None
+    lease_id: str | None = None
+    error: str = ""
+    metadata: dict[str, Any] = Field(default_factory=dict)
+
+
 class TtsJobStatus(BaseModel):
     id: str
     status: str
@@ -177,10 +230,15 @@ class EutherLinkTts:
         self.dots_worker_process: subprocess.Popen[bytes] | None = None
         self.heavy_tts_suspended_until = 0.0
         self.heavy_tts_suspend_reason = ""
+        self.resource_condition = threading.Condition()
+        self.resource_waiters: dict[str, dict[str, Any]] = {}
         self.executor = concurrent.futures.ThreadPoolExecutor(max_workers=tts_parallelism())
 
         self.jobs_dir = config.data_dir / "jobs"
         self.jobs_dir.mkdir(parents=True, exist_ok=True)
+        self.gpu_jobs_dir = config.data_dir / "gpu-jobs"
+        self.gpu_jobs_dir.mkdir(parents=True, exist_ok=True)
+        self.resource_lock_path = config.data_dir / "resource-lock.json"
 
     def load_model(self) -> VoxCPM:
         if self.model is None:
@@ -379,6 +437,7 @@ class EutherLinkTts:
     def resource_status(self) -> dict[str, Any]:
         heavy_tts_suspended = self.heavy_tts_suspended()
         return {
+            "gpu_lease": self.current_gpu_lease_state(),
             "tts": {
                 "queued_or_running": sum(
                     1 for job in self.jobs.values() if job.status in {"queued", "loading", "running"}
@@ -396,6 +455,289 @@ class EutherLinkTts:
             "ollama": ollama_status(),
             "gpu": gpu_status(),
         }
+
+    def current_gpu_lease_state(self) -> dict[str, Any]:
+        lease = self._read_gpu_lease()
+        now = time.time()
+        if lease and float(lease.get("expires_at", 0)) <= now:
+            lease = None
+        with self.resource_condition:
+            waiters = sorted(
+                self.resource_waiters.values(),
+                key=lambda item: (-int(item.get("priority", 0)), float(item.get("created_at", 0))),
+            )
+            return {
+                "active": lease,
+                "queue": waiters,
+                "queue_length": len(waiters),
+            }
+
+    def create_gpu_job(self, request: GpuJobRequest) -> dict[str, Any]:
+        now = time.time()
+        job_id = uuid.uuid4().hex
+        clean_metadata = {
+            key: value
+            for key, value in request.metadata.items()
+            if isinstance(key, str) and isinstance(value, (str, int, float, bool))
+        }
+        job = {
+            "id": job_id,
+            "owner": request.owner,
+            "owner_id": request.owner_id or job_id,
+            "label": request.label or request.owner,
+            "kind": request.kind,
+            "priority": request.priority,
+            "status": "queued",
+            "progress": 0.0,
+            "message": "Waiting for GPU slot",
+            "created_at": now,
+            "updated_at": now,
+            "started_at": None,
+            "finished_at": None,
+            "expires_at": None,
+            "ttl_seconds": request.ttl_seconds,
+            "lease_id": None,
+            "error": "",
+            "metadata": clean_metadata,
+        }
+        with self.resource_condition:
+            self._write_gpu_job(job)
+            self._promote_gpu_jobs_locked()
+            return self._read_gpu_job(job_id) or job
+
+    def get_gpu_job(self, job_id: str) -> dict[str, Any]:
+        with self.resource_condition:
+            self._promote_gpu_jobs_locked()
+            job = self._read_gpu_job(job_id)
+        if not job:
+            raise KeyError(job_id)
+        return job
+
+    def list_gpu_jobs(self, *, limit: int = 100) -> list[dict[str, Any]]:
+        with self.resource_condition:
+            self._promote_gpu_jobs_locked()
+            jobs = []
+            for path in self.gpu_jobs_dir.glob("*.json"):
+                try:
+                    data = json.loads(path.read_text(encoding="utf-8"))
+                except (OSError, json.JSONDecodeError):
+                    continue
+                if isinstance(data, dict):
+                    jobs.append(data)
+        jobs.sort(key=lambda item: float(item.get("updated_at", 0)), reverse=True)
+        return jobs[:limit]
+
+    def heartbeat_gpu_job(self, job_id: str, request: GpuJobUpdateRequest) -> dict[str, Any]:
+        now = time.time()
+        with self.resource_condition:
+            job = self._read_gpu_job(job_id)
+            if not job:
+                raise KeyError(job_id)
+            if job.get("status") != "running":
+                raise RuntimeError(f"GPU job is {job.get('status')}")
+            ttl_seconds = int(request.ttl_seconds or job.get("ttl_seconds") or 3600)
+            job["updated_at"] = now
+            job["expires_at"] = now + ttl_seconds
+            if request.progress is not None:
+                job["progress"] = float(request.progress)
+            if request.message:
+                job["message"] = request.message
+            lease = self._read_gpu_lease()
+            if lease and lease.get("job_id") == job_id:
+                lease["updated_at"] = now
+                lease["expires_at"] = job["expires_at"]
+                lease["ttl_seconds"] = ttl_seconds
+                self._write_gpu_lease(lease)
+            self._write_gpu_job(job)
+            return job
+
+    def release_gpu_job(self, job_id: str, *, status: str = "done", message: str = "") -> dict[str, Any]:
+        now = time.time()
+        with self.resource_condition:
+            job = self._read_gpu_job(job_id)
+            if not job:
+                raise KeyError(job_id)
+            if job.get("status") in {"done", "failed", "cancelled"}:
+                return job
+            final_status = status if status in {"done", "failed", "cancelled"} else "done"
+            job["status"] = final_status
+            job["progress"] = 1.0
+            job["updated_at"] = now
+            job["finished_at"] = now
+            job["expires_at"] = None
+            job["message"] = message or final_status
+            if final_status == "failed":
+                job["error"] = message or "GPU job failed"
+            lease = self._read_gpu_lease()
+            if lease and lease.get("job_id") == job_id:
+                self._write_gpu_lease(None)
+            self._write_gpu_job(job)
+            self._promote_gpu_jobs_locked()
+            self.resource_condition.notify_all()
+            return job
+
+    def _promote_gpu_jobs_locked(self) -> None:
+        now = time.time()
+        current = self._read_gpu_lease()
+        if current and float(current.get("expires_at", 0)) <= now:
+            current_job_id = str(current.get("job_id") or "")
+            if current_job_id:
+                current_job = self._read_gpu_job(current_job_id)
+                if current_job and current_job.get("status") == "running":
+                    current_job["status"] = "failed"
+                    current_job["progress"] = 1.0
+                    current_job["updated_at"] = now
+                    current_job["finished_at"] = now
+                    current_job["expires_at"] = None
+                    current_job["error"] = "GPU lease expired"
+                    current_job["message"] = "GPU lease expired"
+                    self._write_gpu_job(current_job)
+            self._write_gpu_lease(None)
+            current = None
+        if current:
+            return
+        queued = []
+        for path in self.gpu_jobs_dir.glob("*.json"):
+            try:
+                job = json.loads(path.read_text(encoding="utf-8"))
+            except (OSError, json.JSONDecodeError):
+                continue
+            if isinstance(job, dict) and job.get("status") == "queued":
+                queued.append(job)
+        if not queued:
+            return
+        queued.sort(key=lambda item: (-int(item.get("priority", 0)), float(item.get("created_at", 0))))
+        job = queued[0]
+        ttl_seconds = int(job.get("ttl_seconds") or 3600)
+        lease_id = uuid.uuid4().hex
+        job["status"] = "running"
+        job["message"] = "GPU slot acquired"
+        job["started_at"] = now
+        job["updated_at"] = now
+        job["expires_at"] = now + ttl_seconds
+        job["lease_id"] = lease_id
+        lease = {
+            "lease_id": lease_id,
+            "job_id": job["id"],
+            "owner": job.get("owner"),
+            "owner_id": job.get("owner_id"),
+            "label": job.get("label"),
+            "priority": job.get("priority"),
+            "acquired_at": now,
+            "updated_at": now,
+            "expires_at": job["expires_at"],
+            "ttl_seconds": ttl_seconds,
+        }
+        self._write_gpu_job(job)
+        self._write_gpu_lease(lease)
+
+    def _read_gpu_job(self, job_id: str) -> dict[str, Any] | None:
+        safe_job_id = "".join(ch for ch in job_id if ch.isalnum() or ch in "-_")
+        if safe_job_id != job_id:
+            return None
+        path = self.gpu_jobs_dir / f"{job_id}.json"
+        try:
+            data = json.loads(path.read_text(encoding="utf-8"))
+        except FileNotFoundError:
+            return None
+        except (OSError, json.JSONDecodeError):
+            return None
+        return data if isinstance(data, dict) else None
+
+    def _write_gpu_job(self, job: dict[str, Any]) -> None:
+        job_id = str(job.get("id") or "")
+        safe_job_id = "".join(ch for ch in job_id if ch.isalnum() or ch in "-_")
+        if not safe_job_id or safe_job_id != job_id:
+            raise ValueError("invalid GPU job id")
+        self.gpu_jobs_dir.mkdir(parents=True, exist_ok=True)
+        (self.gpu_jobs_dir / f"{job_id}.json").write_text(
+            json.dumps(job, ensure_ascii=False, indent=2, sort_keys=True),
+            encoding="utf-8",
+        )
+
+    def acquire_gpu_lease(self, request: GpuLeaseRequest) -> dict[str, Any]:
+        created_at = time.time()
+        wait_id = uuid.uuid4().hex
+        waiter = {
+            "wait_id": wait_id,
+            "owner": request.owner,
+            "owner_id": request.owner_id,
+            "label": request.label,
+            "priority": request.priority,
+            "created_at": created_at,
+        }
+        deadline = created_at + request.wait_seconds
+        with self.resource_condition:
+            self.resource_waiters[wait_id] = waiter
+            try:
+                while True:
+                    now = time.time()
+                    current = self._read_gpu_lease()
+                    if current and float(current.get("expires_at", 0)) <= now:
+                        current = None
+                    top_waiter = min(
+                        self.resource_waiters.values(),
+                        key=lambda item: (-int(item.get("priority", 0)), float(item.get("created_at", 0))),
+                    )
+                    can_acquire = current is None or current.get("owner_id") == request.owner_id
+                    if can_acquire and top_waiter.get("wait_id") == wait_id:
+                        lease_id = uuid.uuid4().hex
+                        lease = {
+                            "lease_id": lease_id,
+                            "owner": request.owner,
+                            "owner_id": request.owner_id,
+                            "label": request.label or request.owner,
+                            "priority": request.priority,
+                            "acquired_at": now,
+                            "updated_at": now,
+                            "expires_at": now + request.ttl_seconds,
+                            "ttl_seconds": request.ttl_seconds,
+                        }
+                        self._write_gpu_lease(lease)
+                        self.resource_waiters.pop(wait_id, None)
+                        self.resource_condition.notify_all()
+                        return {"ok": True, "status": "acquired", "lease": lease, "message": "GPU lease acquired"}
+                    if request.wait_seconds <= 0 or now >= deadline:
+                        message = "GPU is busy"
+                        if current:
+                            message = f"GPU is busy: {current.get('label') or current.get('owner')}"
+                        return {"ok": False, "status": "queued" if request.wait_seconds > 0 else "busy", "lease": current, "message": message}
+                    remaining = max(0.1, min(2.0, deadline - now))
+                    self.resource_condition.wait(timeout=remaining)
+            finally:
+                self.resource_waiters.pop(wait_id, None)
+
+    def release_gpu_lease(self, lease_id: str) -> dict[str, Any]:
+        with self.resource_condition:
+            current = self._read_gpu_lease()
+            if not current:
+                return {"ok": True, "status": "released", "message": "GPU lease was already empty"}
+            if current.get("lease_id") != lease_id and current.get("owner_id") != lease_id:
+                raise RuntimeError("GPU lease is owned by another job")
+            self._write_gpu_lease(None)
+            self.resource_condition.notify_all()
+            return {"ok": True, "status": "released", "message": "GPU lease released"}
+
+    def _read_gpu_lease(self) -> dict[str, Any] | None:
+        try:
+            data = json.loads(self.resource_lock_path.read_text(encoding="utf-8"))
+        except FileNotFoundError:
+            return None
+        except (OSError, json.JSONDecodeError):
+            return None
+        if not isinstance(data, dict) or not data.get("lease_id"):
+            return None
+        return data
+
+    def _write_gpu_lease(self, lease: dict[str, Any] | None) -> None:
+        self.resource_lock_path.parent.mkdir(parents=True, exist_ok=True)
+        if lease is None:
+            try:
+                self.resource_lock_path.unlink()
+            except FileNotFoundError:
+                pass
+            return
+        self.resource_lock_path.write_text(json.dumps(lease, ensure_ascii=False, indent=2, sort_keys=True), encoding="utf-8")
 
     def prewarm_dots_worker(self) -> None:
         if self.heavy_tts_suspended():
@@ -1350,6 +1692,78 @@ def build_app(service: EutherLinkTts) -> FastAPI:
     @app.get("/v1/resources")
     def get_resources() -> dict[str, Any]:
         return service.resource_status()
+
+    @app.get("/v1/resources/gpu/lease")
+    def get_gpu_lease() -> dict[str, Any]:
+        return service.current_gpu_lease_state()
+
+    @app.post("/v1/resources/gpu/lease", response_model=GpuLeaseResponse)
+    def acquire_gpu_lease(request: GpuLeaseRequest) -> GpuLeaseResponse:
+        result = service.acquire_gpu_lease(request)
+        status_code = 200 if result.get("ok") else 409
+        response = GpuLeaseResponse(
+            ok=bool(result.get("ok")),
+            status=str(result.get("status") or ""),
+            lease=result.get("lease"),
+            message=str(result.get("message") or ""),
+            resources=service.resource_status(),
+        )
+        if status_code == 409:
+            raise HTTPException(status_code=409, detail=response.model_dump())
+        return response
+
+    @app.delete("/v1/resources/gpu/lease/{lease_id}", response_model=GpuLeaseResponse)
+    def release_gpu_lease(lease_id: str) -> GpuLeaseResponse:
+        try:
+            result = service.release_gpu_lease(lease_id)
+        except RuntimeError as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
+        return GpuLeaseResponse(
+            ok=bool(result.get("ok")),
+            status=str(result.get("status") or ""),
+            lease=None,
+            message=str(result.get("message") or ""),
+            resources=service.resource_status(),
+        )
+
+    @app.post("/v1/gpu/jobs", response_model=GpuJobStatus)
+    def create_gpu_job(request: GpuJobRequest) -> GpuJobStatus:
+        return GpuJobStatus(**service.create_gpu_job(request))
+
+    @app.get("/v1/gpu/jobs", response_model=list[GpuJobStatus])
+    def list_gpu_jobs(limit: int = 100) -> list[GpuJobStatus]:
+        limit = max(1, min(limit, 500))
+        return [GpuJobStatus(**job) for job in service.list_gpu_jobs(limit=limit)]
+
+    @app.get("/v1/gpu/jobs/{job_id}", response_model=GpuJobStatus)
+    def get_gpu_job(job_id: str) -> GpuJobStatus:
+        try:
+            return GpuJobStatus(**service.get_gpu_job(job_id))
+        except KeyError:
+            raise HTTPException(status_code=404, detail="GPU job not found") from None
+
+    @app.post("/v1/gpu/jobs/{job_id}/heartbeat", response_model=GpuJobStatus)
+    def heartbeat_gpu_job(job_id: str, request: GpuJobUpdateRequest) -> GpuJobStatus:
+        try:
+            return GpuJobStatus(**service.heartbeat_gpu_job(job_id, request))
+        except KeyError:
+            raise HTTPException(status_code=404, detail="GPU job not found") from None
+        except RuntimeError as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
+
+    @app.post("/v1/gpu/jobs/{job_id}/release", response_model=GpuJobStatus)
+    def release_gpu_job(job_id: str, request: GpuJobUpdateRequest = GpuJobUpdateRequest()) -> GpuJobStatus:
+        try:
+            return GpuJobStatus(**service.release_gpu_job(job_id, status="done", message=request.message or "done"))
+        except KeyError:
+            raise HTTPException(status_code=404, detail="GPU job not found") from None
+
+    @app.post("/v1/gpu/jobs/{job_id}/cancel", response_model=GpuJobStatus)
+    def cancel_gpu_job(job_id: str, request: GpuJobUpdateRequest = GpuJobUpdateRequest()) -> GpuJobStatus:
+        try:
+            return GpuJobStatus(**service.release_gpu_job(job_id, status="cancelled", message=request.message or "cancelled"))
+        except KeyError:
+            raise HTTPException(status_code=404, detail="GPU job not found") from None
 
     @app.post("/v1/resources/heavy-tts/suspend", response_model=ResourceActionResult)
     def suspend_heavy_tts(request: HeavyTtsSuspendRequest) -> ResourceActionResult:
