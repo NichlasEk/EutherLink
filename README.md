@@ -140,3 +140,7 @@ curl -s -X POST http://127.0.0.1:8765/v1/gpu/jobs/JOB_ID/release \
 
 Use `GET /v1/gpu/jobs` and `GET /v1/resources` to inspect the active owner and
 waiting queue.
+
+Dots TTS prewarming is off by default so it does not occupy VRAM outside the
+global scheduler. Set `EUTHERLINK_PREWARM_DOTS=1` only when the host is dedicated
+to TTS and no other GPU clients need fair scheduling.

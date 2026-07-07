@@ -59,7 +59,7 @@ GRAPHENE_MATCHA_CONFIG = "app/src/main/res/raw/en_us__g2p__config.json"
 GRAPHENE_MATCHA_SAMPLE_RATE = 22_050
 GRAPHENE_MATCHA_PYTHON = "python"
 GRAPHENE_MATCHA_RENDERER = str(REPO_ROOT / "scripts" / "render_graphene_matcha.py")
-PREWARM_DOTS_DEFAULT = "1"
+PREWARM_DOTS_DEFAULT = "0"
 OLLAMA_URL = "http://127.0.0.1:11434"
 OLLAMA_AGENT_MODEL = "qwen3-coder:30b"
 
